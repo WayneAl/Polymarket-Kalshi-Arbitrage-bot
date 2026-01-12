@@ -120,7 +120,7 @@ async fn main() -> Result<()> {
     // === MARKET DISCOVERY (Polymarket Only) ===
     info!("🔍 Starting Polymarket-only discovery for 'Bitcoin'...");
     let gamma_client = crate::polymarket::GammaClient::new();
-    let markets = gamma_client.fetch_markets("bitcoin").await?;
+    let markets = gamma_client.fetch_markets("15M").await?;
 
     let mut pairs = Vec::new();
     for market in markets {
@@ -143,6 +143,10 @@ async fn main() -> Result<()> {
                         poly_no_token: Arc::from(tokens[1].clone()),
                         line_value: None,
                         team_suffix: None,
+                        expiry_timestamp: market
+                            .end_date_iso
+                            .and_then(|iso| chrono::DateTime::parse_from_rfc3339(&iso).ok())
+                            .map(|dt| dt.timestamp_millis()),
                     };
                     pairs.push(pair);
                 }

@@ -128,7 +128,7 @@ impl GammaClient {
     }
     pub async fn fetch_markets(&self, tag: &str) -> Result<Vec<GammaMarket>> {
         let url = format!(
-            "{}/markets?tag_slug={}&active=true&closed=false&limit=100",
+            "{}/events?tag_slug={}&order=endDate&ascending=true&closed=false&limit=4",
             GAMMA_API_BASE, tag
         );
         info!("[GAMMA] Fetching markets for tag: {}", tag);
@@ -139,11 +139,19 @@ impl GammaClient {
             anyhow::bail!("Gamma API request failed: {}", resp.status());
         }
 
-        let markets: Vec<GammaMarket> = resp.json().await?;
+        let events: Vec<GammaEvent> = resp.json().await?;
+        let markets: Vec<GammaMarket> =
+            events.into_iter().flat_map(|event| event.markets).collect();
+
         info!("[GAMMA] Found {} markets for tag '{}'", markets.len(), tag);
 
         Ok(markets)
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GammaEvent {
+    pub markets: Vec<GammaMarket>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,6 +168,20 @@ pub struct GammaMarket {
     pub slug: Option<String>,
     #[serde(rename = "groupItemTitle")]
     pub group_item_title: Option<String>,
+    #[serde(rename = "endDateIso")]
+    pub end_date_iso: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Price {
+    #[serde(rename = "openPrice")]
+    pub open_price: f64,
+    #[serde(rename = "closePrice")]
+    pub close_price: Option<f64>,
+    pub timestamp: u64,
+    pub completed: bool,
+    pub incomplete: bool,
+    pub cached: bool,
 }
 
 /// Increment the date in a Polymarket slug by 1 day

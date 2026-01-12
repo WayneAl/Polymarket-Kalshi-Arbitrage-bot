@@ -513,6 +513,7 @@ mod infra_integration_tests {
             poly_no_token: "arb_no_token".into(),
             line_value: None,
             team_suffix: Some("CFC".into()),
+            expiry_timestamp: None,
         };
 
         let market_id = state.add_pair(pair).unwrap();
@@ -740,6 +741,7 @@ mod infra_integration_tests {
                 poly_no_token: format!("no_{}", i).into(),
                 line_value: None,
                 team_suffix: None,
+                expiry_timestamp: None,
             };
 
             let id = state.add_pair(pair).unwrap();
@@ -1399,6 +1401,7 @@ mod process_mock_tests {
             poly_no_token: "pf_no_token".into(),
             line_value: None,
             team_suffix: None,
+            expiry_timestamp: None,
         }
     }
 

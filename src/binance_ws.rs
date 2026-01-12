@@ -62,6 +62,7 @@ impl BinanceClient {
         let (_, mut read) = ws_stream.split();
 
         while let Some(message) = read.next().await {
+            // println!("[BINANCE] Received message: {:?}", message);
             match message? {
                 Message::Text(text) => match serde_json::from_str::<BookTickerEvent>(&text) {
                     Ok(event) => {
