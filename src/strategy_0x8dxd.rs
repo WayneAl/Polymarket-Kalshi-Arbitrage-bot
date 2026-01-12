@@ -4,7 +4,7 @@ use rand::distributions::Distribution;
 use rand::thread_rng;
 use regex::Regex;
 use statrs::distribution::{ContinuousCDF, Normal};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::broadcast;
@@ -28,6 +28,11 @@ pub enum PricingModel {
     MonteCarlo,
 }
 
+pub struct CachedMarketInfo {
+    strike_price: f64,
+    expiry_ts: i64,
+}
+
 pub struct Strategy0x8dxd {
     state: Arc<GlobalState>,
     client: Arc<SharedAsyncClient>,
@@ -35,6 +40,7 @@ pub struct Strategy0x8dxd {
     regex: Regex,
     price_history: VecDeque<(Instant, f64)>, // (Timestamp, Price)
     pricing_model: PricingModel,
+    market_cache: HashMap<String, CachedMarketInfo>,
 }
 
 impl Strategy0x8dxd {
@@ -63,6 +69,7 @@ impl Strategy0x8dxd {
             regex,
             price_history: VecDeque::new(),
             pricing_model,
+            market_cache: HashMap::new(),
         }
     }
 
@@ -96,38 +103,61 @@ impl Strategy0x8dxd {
 
                     println!("pair: {:?}", pair);
 
-                    // https://polymarket.com/api/crypto/crypto-price?symbol=BTC&eventStartTime=2026-01-12T07:45:00Z&variant=fifteen&endDate=2026-01-12T08:00:00Z
-                    let id = pair.pair_id.split("-").collect::<Vec<&str>>();
-                    let event_start_time = id.last().unwrap().parse::<i64>().unwrap();
-                    let event_start_time_utc = Utc.timestamp_opt(event_start_time, 0).unwrap();
-                    let event_start_time_str =
-                        event_start_time_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                    // Check cache first
+                    let (strike_price, expiry_ts) = if let Some(info) =
+                        self.market_cache.get(pair.pair_id.as_ref())
+                    {
+                        (info.strike_price, info.expiry_ts)
+                    } else {
+                        // Fetch if not in cache
+                        // https://polymarket.com/api/crypto/crypto-price?symbol=BTC&eventStartTime=2026-01-12T07:45:00Z&variant=fifteen&endDate=2026-01-12T08:00:00Z
+                        let id = pair.pair_id.split("-").collect::<Vec<&str>>();
+                        let event_start_time = id.last().unwrap().parse::<i64>().unwrap();
+                        let event_start_time_utc = Utc.timestamp_opt(event_start_time, 0).unwrap();
+                        let event_start_time_str =
+                            event_start_time_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-                    let event_end_time_utc = event_start_time_utc + chrono::Duration::minutes(15);
-                    let event_end_time_str =
-                        event_end_time_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-                    let expiry_ts = event_end_time_utc.timestamp();
+                        let event_end_time_utc =
+                            event_start_time_utc + chrono::Duration::minutes(15);
+                        let event_end_time_str =
+                            event_end_time_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                        let expiry_ts = event_end_time_utc.timestamp();
 
-                    let symbol = match id.get(1) {
-                        Some(&"btc") => "BTC",
-                        _ => todo!(),
-                    };
+                        let symbol = match id.get(1) {
+                            Some(&"btc") => "BTC",
+                            _ => continue, // Skip if symbol lookup fails or is not BTC (though filtered above)
+                        };
 
-                    let url = format!(
-                            "https://polymarket.com/api/crypto/crypto-price?symbol={}&eventStartTime={}&variant=fifteen&endDate={}",
-                            symbol,event_start_time_str,event_end_time_str,
+                        let url = format!(
+                                "https://polymarket.com/api/crypto/crypto-price?symbol={}&eventStartTime={}&variant=fifteen&endDate={}",
+                                symbol,event_start_time_str,event_end_time_str,
+                            );
+
+                        // println!("url: {:?}", url);
+                        let response = reqwest::get(&url).await?;
+                        let polly_price: Price = response.json().await?;
+                        let strike_price = polly_price.open_price;
+
+                        // Store in cache
+                        self.market_cache.insert(
+                            pair.pair_id.to_string(),
+                            CachedMarketInfo {
+                                strike_price,
+                                expiry_ts,
+                            },
                         );
 
-                    println!("url: {:?}", url);
-                    let response = reqwest::get(&url).await?;
-                    let polly_price: Price = response.json().await?;
-                    // println!("polly_price: {:?}", polly_price);
-                    let strike_price = polly_price.open_price;
-                    println!("strike_price: {}", strike_price);
+                        info!(
+                            "[0x8dxd] Cached market info for {}: Strike={}, Expiry={}",
+                            pair.pair_id, strike_price, expiry_ts
+                        );
+
+                        (strike_price, expiry_ts)
+                    };
 
                     let now_ts = Utc::now().timestamp();
                     let time_remaining_secs = expiry_ts - now_ts;
-                    println!("time_remaining_secs: {}", time_remaining_secs);
+                    // println!("time_remaining_secs: {}", time_remaining_secs);
 
                     // Skip if expired
                     if time_remaining_secs <= 0 {
@@ -141,13 +171,13 @@ impl Strategy0x8dxd {
 
                     // Calculate Fair Probability (Target Price)
                     let fair_prob_yes = match self.pricing_model {
-                        PricingModel::BlackScholes => self.calculate_prob_bs(
+                        PricingModel::BlackScholes => Self::calculate_prob_bs(
                             btc_price,
                             strike_price,
                             time_to_expiry_years,
                             sigma,
                         ),
-                        PricingModel::MonteCarlo => self.calculate_prob_mc(
+                        PricingModel::MonteCarlo => Self::calculate_prob_mc(
                             btc_price,
                             strike_price,
                             time_to_expiry_years,
@@ -156,7 +186,7 @@ impl Strategy0x8dxd {
                     };
                     println!("BTC Price: {}", btc_price);
                     println!("Strike Price: {}", strike_price);
-                    println!("Time to Expiry: {}", time_to_expiry_years);
+                    println!("Time to Expiry: {} secs", time_remaining_secs);
                     println!("Sigma: {}", sigma);
                     println!("Fair prob yes: {}", fair_prob_yes);
 
@@ -247,18 +277,19 @@ impl Strategy0x8dxd {
 
     /// Black-Scholes Binary Call Option Pricing
     /// Price of "Asset > Strike" = N(d2) in Black-Scholes framework for digital options
-    fn calculate_prob_bs(&self, s: f64, k: f64, t: f64, sigma: f64) -> f64 {
+    fn calculate_prob_bs(s: f64, k: f64, t: f64, sigma: f64) -> f64 {
         if t <= 0.0 {
             return if s > k { 1.0 } else { 0.0 };
         }
         let d2 = ((s / k).ln() + (RISK_FREE_RATE - 0.5 * sigma * sigma) * t) / (sigma * t.sqrt());
         let normal = Normal::new(0.0, 1.0).unwrap();
         normal.cdf(d2)
+        // (-RISK_FREE_RATE * t).exp() * normal.cdf(d2)
     }
 
     /// Monte Carlo Simulation for Binary Call Option
-    fn calculate_prob_mc(&self, s: f64, k: f64, t: f64, sigma: f64) -> f64 {
-        let iterations = 1000;
+    fn calculate_prob_mc(s: f64, k: f64, t: f64, sigma: f64) -> f64 {
+        let iterations = 10000;
         let dt = t; // Single step simulation for simplicity, can be detailed
         let drift = (RISK_FREE_RATE - 0.5 * sigma * sigma) * dt;
         let diffusion = sigma * dt.sqrt();
@@ -321,5 +352,89 @@ impl Strategy0x8dxd {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calculate_prob_bs() {
+        // 1. Deep ITM: Price=150, Strike=100, T=0.1 (short time) -> Should be close to 1.0
+        let prob_itm = Strategy0x8dxd::calculate_prob_bs(
+            90672.975,
+            90630.06358168717,
+            0.000016076864535768644,
+            0.01335172967371621,
+        );
+        println!("ITM probability: {}", prob_itm);
+        assert!(
+            prob_itm > 0.9,
+            "ITM probability should be high, got {}",
+            prob_itm
+        );
+
+        // 2. Deep OTM: Price=50, Strike=100, T=0.1 -> Should be close to 0.0
+        let prob_otm = Strategy0x8dxd::calculate_prob_bs(50.0, 100.0, 0.1, 0.5);
+        assert!(
+            prob_otm < 0.1,
+            "OTM probability should be low, got {}",
+            prob_otm
+        );
+        println!("OTM probability: {}", prob_otm);
+
+        // 3. Expired ITM: Time=0, Price=150, Strike=100 -> 1.0
+        let prob_expired_itm = Strategy0x8dxd::calculate_prob_bs(150.0, 100.0, 0.0, 0.5);
+        assert_eq!(prob_expired_itm, 1.0);
+        println!("Expired ITM probability: {}", prob_expired_itm);
+
+        // 4. Expired OTM: Time=0, Price=50, Strike=100 -> 0.0
+        let prob_expired_otm = Strategy0x8dxd::calculate_prob_bs(50.0, 100.0, 0.0, 0.5);
+        assert_eq!(prob_expired_otm, 0.0);
+        println!("Expired OTM probability: {}", prob_expired_otm);
+    }
+
+    #[test]
+    fn test_calculate_prob_mc() {
+        // Monte Carlo is random, so we check ranges and consistency with BS
+
+        // 1. ITM (T=0.1)
+        let prob_itm = Strategy0x8dxd::calculate_prob_mc(150.0, 100.0, 0.1, 0.5);
+        assert!(
+            prob_itm > 0.9,
+            "MC ITM probability should be high, got {}",
+            prob_itm
+        );
+        println!("MC ITM probability: {}", prob_itm);
+
+        // 2. OTM (T=0.1)
+        let prob_otm = Strategy0x8dxd::calculate_prob_mc(50.0, 100.0, 0.1, 0.5);
+        assert!(
+            prob_otm < 0.1,
+            "MC OTM probability should be low, got {}",
+            prob_otm
+        );
+        println!("MC OTM probability: {}", prob_otm);
+
+        // 3. Convergence with BS (ATM)
+        // Price=100, Strike=100, T=1, Sigma=0.5
+        let bs_prob = Strategy0x8dxd::calculate_prob_bs(100.0, 100.0, 1.0, 0.5);
+        let mc_prob = Strategy0x8dxd::calculate_prob_mc(100.0, 100.0, 1.0, 0.5);
+        println!("BS ATM probability: {}", bs_prob);
+        println!("MC ATM probability: {}", mc_prob);
+
+        // MC with 1000 iter has standard error ~ sqrt(p(1-p)/1000). For p=0.5, sqrt(0.25/1000) = sqrt(0.00025) = 0.015.
+        // 3 sigma is 0.045.
+        // Diff limit 0.15 is generous enough.
+        let diff = (bs_prob - mc_prob).abs();
+        assert!(
+            diff < 0.01,
+            "MC and BS should be somewhat close. BS: {}, MC: {}, Diff: {}",
+            bs_prob,
+            mc_prob,
+            diff
+        );
+        println!("MC and BS difference: {}", diff);
     }
 }
