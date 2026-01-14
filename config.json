@@ -1,0 +1,24 @@
+{
+  "assets": [
+    {
+      "symbol": "BTC",
+      "keywords": ["bitcoin", "btc"],
+      "default_sigma": 0.5
+    },
+    {
+      "symbol": "ETH",
+      "keywords": ["ethereum", "eth"],
+      "default_sigma": 0.65
+    },
+    {
+      "symbol": "SOL",
+      "keywords": ["solana", "sol"],
+      "default_sigma": 0.7
+    },
+    {
+      "symbol": "XRP",
+      "keywords": ["ripple", "xrp"],
+      "default_sigma": 0.8
+    }
+  ]
+}

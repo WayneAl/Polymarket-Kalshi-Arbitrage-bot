@@ -39,6 +39,8 @@ pub struct Strategy0x8dxd {
     strike_price: f64,
     expiry_ts: i64,
     binance_ref_price: f64,
+
+    default_sigma: f64,
 }
 
 impl Strategy0x8dxd {
@@ -46,6 +48,7 @@ impl Strategy0x8dxd {
         state: Arc<tokio::sync::RwLock<GlobalState>>,
         market_id: u16,
         asset: String,
+        default_sigma: f64,
         client: Arc<SharedAsyncClient>,
         binance_client: BinanceClient,
     ) -> Self {
@@ -59,7 +62,7 @@ impl Strategy0x8dxd {
         let price_rx = binance_client.subscribe(&asset);
 
         // Fetch market info (strike, expiry, ref price)
-        let (strike_price, expiry_ts, binance_ref_price) = {
+        let (strike_price, expiry_ts, _binance_ref_price) = {
             let s = state.read().await;
             let market = s.get_by_id(market_id).expect("Invalid market_id");
             let p = market.pair.as_ref().unwrap();
@@ -93,12 +96,13 @@ impl Strategy0x8dxd {
             let s = state.read().await;
             let market = s.get_by_id(market_id).expect("Invalid market_id");
             info!(
-                "[0x8dxd] Initialized strategy for {} (Asset: {}) with Pricing Model: {:?}. Strike={}, Ref={}",
+                "[0x8dxd] Initialized strategy for {} (Asset: {}) with Pricing Model: {:?}. Strike={}, Ref={}, Sigma={}",
                 market.pair.as_ref().map(|p| p.pair_id.as_ref()).unwrap_or("Unknown"),
                 asset,
                 pricing_model,
                 strike_price,
-                binance_ref_price
+                binance_ref_price,
+                default_sigma
             );
         }
 
@@ -113,6 +117,7 @@ impl Strategy0x8dxd {
             strike_price,
             expiry_ts,
             binance_ref_price,
+            default_sigma,
         }
     }
 
@@ -163,7 +168,7 @@ impl Strategy0x8dxd {
 
         // Calculate Realized Volatility (Annualized)
         let mut sigma = self.binance_client.get_iv(&self.asset).unwrap_or(0.5);
-        sigma = sigma.max(0.6);
+        sigma = sigma.max(self.default_sigma);
 
         let now_ts = Utc::now().timestamp();
         let time_remaining_secs = self.expiry_ts - now_ts;
@@ -200,10 +205,11 @@ impl Strategy0x8dxd {
             ),
         };
 
-        info!(
-            "Price: {}, Strike: {}, Time: {}, Prob: {}s, Sigma: {}",
-            calibrated_btc_price, self.strike_price, time_remaining_secs, fair_prob_yes, sigma
-        );
+        // info!(
+        //     target: "strategy_0x8dxd",
+        //     "Price: {}, Strike: {}, Time: {}, Prob: {}s, Sigma: {}",
+        //     calibrated_btc_price, self.strike_price, time_remaining_secs, fair_prob_yes, sigma
+        // );
 
         let fair_prob_no = 1.0 - fair_prob_yes;
         let mut opps = Vec::new();
@@ -216,7 +222,7 @@ impl Strategy0x8dxd {
             (p.poly_yes_token.clone(), p.poly_no_token.clone(), ya, na)
         };
 
-        info!("YES ASK: {} NO ASK: {}", yes_ask, no_ask);
+        // info!("YES ASK: {} NO ASK: {}", yes_ask, no_ask);
 
         if yes_ask > 0 {
             let market_price_yes = yes_ask as f64 / 100.0;

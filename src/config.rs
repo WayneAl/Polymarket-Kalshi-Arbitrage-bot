@@ -174,3 +174,21 @@ pub fn get_league_config(league: &str) -> Option<LeagueConfig> {
         .into_iter()
         .find(|c| c.league_code == league || c.poly_prefix == league)
 }
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct AssetConfig {
+    pub symbol: String,
+    pub keywords: Vec<String>,
+    pub default_sigma: f64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Config {
+    pub assets: Vec<AssetConfig>,
+}
+
+pub fn load_config(path: &str) -> anyhow::Result<Config> {
+    let content = std::fs::read_to_string(path)?;
+    let config = serde_json::from_str(&content)?;
+    Ok(config)
+}

@@ -42,6 +42,14 @@ const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
 /// Polygon chain ID
 const POLYGON_CHAIN_ID: u64 = 137;
 
+struct SimpleTime;
+impl tracing_subscriber::fmt::time::FormatTime for SimpleTime {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        let now = chrono::Utc::now();
+        write!(w, "{}", now.format("%Y-%m-%dT%H:%M:%SZ"))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
@@ -49,6 +57,7 @@ async fn main() -> Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env().add_directive(Level::INFO.into()),
         )
+        .with_timer(SimpleTime)
         .init();
 
     info!("🚀 Prediction Market Arbitrage System v2.0");
@@ -62,6 +71,11 @@ async fn main() -> Result<()> {
     } else {
         warn!("   Mode: LIVE EXECUTION");
     }
+
+    // Load configuration
+    info!("[CONFIG] Loading config.json...");
+    let config = crate::config::load_config("config.json").context("Failed to load config.json")?;
+    info!("[CONFIG] Loaded {} assets", config.assets.len());
 
     // Load Polymarket credentials
     dotenvy::dotenv().ok();
@@ -94,7 +108,8 @@ async fn main() -> Result<()> {
 
     // 2. Initialize Binance Price Feed (One for all strategies)
     // 2. Initialize Binance Price Feed (One loop, shared history)
-    info!("🚀 Connecting to Binance Stream for [BTC, ETH, SOL, XRP]...");
+    let symbols: Vec<String> = config.assets.iter().map(|a| a.symbol.clone()).collect();
+    info!("🚀 Connecting to Binance Stream for {:?}...", symbols);
     let (binance_client, binance_driver) =
         crate::binance_ws::BinanceClient::new(crate::binance_ws::BINANCE_WS_URL.to_string());
 
@@ -109,12 +124,9 @@ async fn main() -> Result<()> {
     let mut active_strategies: std::collections::HashMap<u16, tokio::task::JoinHandle<()>> =
         std::collections::HashMap::new();
 
-    let mut init = true;
-
     loop {
         // "Use a while init || ... loop" - We integrate this condition into our persistent loop
-        if init || chrono::Local::now().timestamp() % 900 == 0 {
-            init = false;
+        if active_strategies.is_empty() || chrono::Local::now().timestamp() % 900 == 0 {
             info!("🔄 Starting Discovery (Time: {})", chrono::Local::now());
 
             // A. Discovery
@@ -172,25 +184,31 @@ async fn main() -> Result<()> {
                 let pair = market.pair.as_ref().unwrap();
                 let desc = pair.description.to_lowercase();
 
-                let asset = if desc.contains("bitcoin") {
-                    Some("BTC")
-                } else if desc.contains("ethereum") {
-                    Some("ETH")
-                } else if desc.contains("solana") {
-                    Some("SOL")
-                } else if desc.contains("ripple") || desc.contains("xrp") {
-                    Some("XRP")
-                } else {
-                    None
-                };
+                // Check against config assets
+                let mut matched_asset = None;
+                for asset_cfg in &config.assets {
+                    for keyword in &asset_cfg.keywords {
+                        if desc.contains(keyword) {
+                            matched_asset = Some(asset_cfg);
+                            break;
+                        }
+                    }
+                    if matched_asset.is_some() {
+                        break;
+                    }
+                }
 
-                if let Some(asset_str) = asset {
-                    info!("✨ Spawning Strategy for {} ({})", pair.pair_id, asset_str);
+                if let Some(asset_cfg) = matched_asset {
+                    info!(
+                        "✨ Spawning Strategy for {} ({})",
+                        pair.pair_id, asset_cfg.symbol
+                    );
 
                     let strat = crate::strategy_0x8dxd::Strategy0x8dxd::new(
                         state.clone(),
                         market_id,
-                        asset_str.to_string(),
+                        asset_cfg.symbol.clone(),
+                        asset_cfg.default_sigma, // Pass configured default sigma
                         poly_async.clone(),
                         binance_client.clone(),
                     )
@@ -202,7 +220,7 @@ async fn main() -> Result<()> {
             }
 
             // Sleep to ensure we don't spam discovery in the same second
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         }
 
         // Small sleep to prevent busy loop
