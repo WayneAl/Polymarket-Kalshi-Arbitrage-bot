@@ -4,20 +4,18 @@
 //! and REST API client for market discovery via the Gamma API.
 
 use anyhow::{Context, Result};
+use chrono::{TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tokio::time::{interval, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
 use crate::config::{GAMMA_API_BASE, POLYMARKET_WS_URL, POLY_PING_INTERVAL_SECS};
-use crate::execution::NanoClock;
-use crate::types::{
-    fxhash_str, parse_price, ArbType, FastExecutionRequest, GlobalState, PriceCents, SizeCents,
-};
+
+use crate::types::{fxhash_str, parse_price, GlobalState, MarketPair, MarketType, SizeCents};
 
 // === WebSocket Message Types ===
 
@@ -147,6 +145,105 @@ impl GammaClient {
 
         Ok(markets)
     }
+
+    /// Discover specifically "15M" markets and parse them into MarketPair objects
+    pub async fn discover_15m_markets(&self) -> Result<Vec<MarketPair>> {
+        let markets = self.fetch_markets("15M").await?;
+
+        let mut pairs = Vec::new();
+        for market in markets {
+            if let Some(clob_ids_str) = market.clob_token_ids {
+                if let Ok(tokens) = serde_json::from_str::<Vec<String>>(&clob_ids_str) {
+                    if tokens.len() >= 2 {
+                        let slug = market.slug.clone().unwrap_or_else(|| "unknown".to_string());
+                        let question = market.question.clone();
+
+                        let asset = if question.to_lowercase().contains("bitcoin") {
+                            Some("BTC")
+                        } else if question.to_lowercase().contains("ethereum") {
+                            Some("ETH")
+                        } else if question.to_lowercase().contains("solana") {
+                            Some("SOL")
+                        } else if question.to_lowercase().contains("ripple")
+                            || question.to_lowercase().contains("xrp")
+                        {
+                            Some("XRP")
+                        } else {
+                            None
+                        };
+
+                        let expiry_timestamp = market
+                            .end_date
+                            .as_ref()
+                            .and_then(|iso| chrono::DateTime::parse_from_rfc3339(iso).ok())
+                            .map(|dt| dt.timestamp_millis());
+
+                        let mut strike_price: Option<f64> = None;
+
+                        // Fetch strike price if asset and expiry are known
+                        if let (Some(asset_symbol), Some(expiry_ms)) = (asset, expiry_timestamp) {
+                            let expiry_ts = expiry_ms / 1000;
+                            let event_end_time_utc = Utc.timestamp_opt(expiry_ts, 0).unwrap();
+                            let event_start_time_utc =
+                                event_end_time_utc - chrono::Duration::minutes(15);
+                            let event_start_time_str = event_start_time_utc
+                                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                            let event_end_time_str = event_end_time_utc
+                                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+                            let url = format!(
+                                "https://polymarket.com/api/crypto/crypto-price?symbol={}&eventStartTime={}&variant=fifteen&endDate={}",
+                                asset_symbol, event_start_time_str, event_end_time_str,
+                            );
+
+                            info!("[GAMMA] Fetching strike price for {}: {}", slug, url);
+
+                            match self.http.get(&url).send().await {
+                                Ok(resp) => {
+                                    if resp.status().is_success() {
+                                        if let Ok(price_data) = resp.json::<Price>().await {
+                                            strike_price = price_data.open_price;
+                                        } else {
+                                            warn!(
+                                                "[GAMMA] Failed to parse price JSON for {}",
+                                                slug
+                                            );
+                                        }
+                                    } else {
+                                        let status = resp.status();
+                                        let body = resp
+                                            .text()
+                                            .await
+                                            .unwrap_or_else(|_| "Unknown".to_string());
+                                        warn!(
+                                            "[GAMMA] Price API returned status {}: {}",
+                                            status, body
+                                        );
+                                    }
+                                }
+                                Err(e) => warn!("[GAMMA] Failed to fetch price: {}", e),
+                            }
+                        }
+                        if strike_price.is_some() {
+                            // Synthesize a MarketPair
+                            let pair = MarketPair {
+                                pair_id: Arc::from(format!("poly-{}", slug)),
+                                market_type: MarketType::Moneyline, // Defaulting type
+                                description: Arc::from(question),
+                                poly_slug: Arc::from(slug),
+                                poly_yes_token: Arc::from(tokens[0].clone()),
+                                poly_no_token: Arc::from(tokens[1].clone()),
+                                strike_price,
+                                expiry_timestamp,
+                            };
+                            pairs.push(pair);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(pairs)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,12 +267,14 @@ pub struct GammaMarket {
     pub group_item_title: Option<String>,
     #[serde(rename = "endDateIso")]
     pub end_date_iso: Option<String>,
+    #[serde(rename = "endDate")]
+    pub end_date: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Price {
     #[serde(rename = "openPrice")]
-    pub open_price: f64,
+    pub open_price: Option<f64>,
     #[serde(rename = "closePrice")]
     pub close_price: Option<f64>,
     pub timestamp: u64,
@@ -248,22 +347,21 @@ fn parse_size(s: &str) -> SizeCents {
 }
 
 /// WebSocket runner
-pub async fn run_ws(
-    state: Arc<GlobalState>,
-    exec_tx: mpsc::Sender<FastExecutionRequest>,
-    threshold_cents: PriceCents,
-) -> Result<()> {
-    let tokens: Vec<String> = state
-        .markets
-        .iter()
-        .take(state.market_count())
-        .filter_map(|m| m.pair.as_ref())
-        .flat_map(|p| [p.poly_yes_token.to_string(), p.poly_no_token.to_string()])
-        .collect();
+pub async fn run_ws(state: Arc<tokio::sync::RwLock<GlobalState>>) -> Result<()> {
+    // Acquire read lock to get tokens
+    let tokens: Vec<String> = {
+        let s = state.read().await;
+        s.markets
+            .iter()
+            .take(s.market_count())
+            .filter_map(|m| m.pair.as_ref())
+            .flat_map(|p| [p.poly_yes_token.to_string(), p.poly_no_token.to_string()])
+            .collect()
+    };
 
     if tokens.is_empty() {
-        info!("[POLY] No markets to monitor");
-        tokio::time::sleep(Duration::from_secs(u64::MAX)).await;
+        info!("[POLY] No markets to monitor, sleeping...");
+        tokio::time::sleep(Duration::from_secs(5)).await;
         return Ok(());
     }
 
@@ -286,7 +384,6 @@ pub async fn run_ws(
         .await?;
     info!("[POLY] Subscribed to {} tokens", tokens.len());
 
-    let clock = NanoClock::new();
     let mut ping_interval = interval(Duration::from_secs(POLY_PING_INTERVAL_SECS));
     let mut last_message = Instant::now();
 
@@ -307,7 +404,7 @@ pub async fn run_ws(
                         // Try book snapshot first
                         if let Ok(books) = serde_json::from_str::<Vec<BookSnapshot>>(&text) {
                             for book in &books {
-                                process_book(&state, book, &exec_tx, threshold_cents, &clock).await;
+                                process_book(&state, book).await;
                             }
                         }
                         // Try price change event
@@ -315,7 +412,7 @@ pub async fn run_ws(
                             if event.event_type.as_deref() == Some("price_change") {
                                 if let Some(changes) = &event.price_changes {
                                     for change in changes {
-                                        process_price_change(&state, change, &exec_tx, threshold_cents, &clock).await;
+                                        process_price_change(&state, change).await;
                                     }
                                 }
                             }
@@ -360,13 +457,7 @@ pub async fn run_ws(
 
 /// Process book snapshot
 #[inline]
-async fn process_book(
-    state: &GlobalState,
-    book: &BookSnapshot,
-    exec_tx: &mpsc::Sender<FastExecutionRequest>,
-    threshold_cents: PriceCents,
-    clock: &NanoClock,
-) {
+async fn process_book(state: &Arc<tokio::sync::RwLock<GlobalState>>, book: &BookSnapshot) {
     let token_hash = fxhash_str(&book.asset_id);
 
     // Find best ask (lowest price)
@@ -385,38 +476,26 @@ async fn process_book(
         .min_by_key(|(p, _)| *p)
         .unwrap_or((0, 0));
 
-    // Check if YES token
-    if let Some(&market_id) = state.poly_yes_to_id.get(&token_hash) {
-        let market = &state.markets[market_id as usize];
-        market.poly.update_yes(best_ask, ask_size);
+    // Acquire read lock to query maps
+    let s = state.read().await;
 
-        // Check arbs
-        let arb_mask = market.check_arbs(threshold_cents);
-        if arb_mask != 0 {
-            send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;
-        }
+    // Check if YES token
+    if let Some(&market_id) = s.poly_yes_to_id.get(&token_hash) {
+        let market = &s.markets[market_id as usize];
+        market.poly.update_yes(best_ask, ask_size);
     }
     // Check if NO token
-    else if let Some(&market_id) = state.poly_no_to_id.get(&token_hash) {
-        let market = &state.markets[market_id as usize];
+    else if let Some(&market_id) = s.poly_no_to_id.get(&token_hash) {
+        let market = &s.markets[market_id as usize];
         market.poly.update_no(best_ask, ask_size);
-
-        // Check arbs
-        let arb_mask = market.check_arbs(threshold_cents);
-        if arb_mask != 0 {
-            send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;
-        }
     }
 }
 
 /// Process price change
 #[inline]
 async fn process_price_change(
-    state: &GlobalState,
+    state: &Arc<tokio::sync::RwLock<GlobalState>>,
     change: &PriceChangeItem,
-    exec_tx: &mpsc::Sender<FastExecutionRequest>,
-    threshold_cents: PriceCents,
-    clock: &NanoClock,
 ) {
     // Only process ASK side updates
     if !matches!(change.side.as_deref(), Some("ASK" | "ask")) {
@@ -433,9 +512,12 @@ async fn process_price_change(
 
     let token_hash = fxhash_str(&change.asset_id);
 
+    // Lock!
+    let s = state.read().await;
+
     // Check YES token
-    if let Some(&market_id) = state.poly_yes_to_id.get(&token_hash) {
-        let market = &state.markets[market_id as usize];
+    if let Some(&market_id) = s.poly_yes_to_id.get(&token_hash) {
+        let market = &s.markets[market_id as usize];
         let (current_yes, _, current_yes_size, _) = market.poly.load();
 
         // Only update if new price is better (lower)
@@ -443,68 +525,15 @@ async fn process_price_change(
             // Keep existing size - it may be stale but FAK orders handle partial fills.
             // Size is an upper bound anyway; better to attempt arb than miss it.
             market.poly.update_yes(price, current_yes_size);
-
-            let arb_mask = market.check_arbs(threshold_cents);
-            if arb_mask != 0 {
-                send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;
-            }
         }
     }
     // Check NO token
-    else if let Some(&market_id) = state.poly_no_to_id.get(&token_hash) {
-        let market = &state.markets[market_id as usize];
+    else if let Some(&market_id) = s.poly_no_to_id.get(&token_hash) {
+        let market = &s.markets[market_id as usize];
         let (_, current_no, _, current_no_size) = market.poly.load();
 
         if price < current_no || current_no == 0 {
             market.poly.update_no(price, current_no_size);
-
-            let arb_mask = market.check_arbs(threshold_cents);
-            if arb_mask != 0 {
-                send_arb_request(market_id, market, arb_mask, exec_tx, clock).await;
-            }
         }
     }
-}
-
-/// Send arb request to execution engine
-#[inline]
-async fn send_arb_request(
-    market_id: u16,
-    market: &crate::types::AtomicMarketState,
-    arb_mask: u8,
-    exec_tx: &mpsc::Sender<FastExecutionRequest>,
-    clock: &NanoClock,
-) {
-    let (k_yes, k_no, k_yes_size, k_no_size) = market.kalshi.load();
-    let (p_yes, p_no, p_yes_size, p_no_size) = market.poly.load();
-
-    // Priority order: cross-platform arbs first (more reliable)
-    let (yes_price, no_price, yes_size, no_size, arb_type) = if arb_mask & 1 != 0 {
-        // Poly YES + Kalshi NO
-        (p_yes, k_no, p_yes_size, k_no_size, ArbType::PolyYesKalshiNo)
-    } else if arb_mask & 2 != 0 {
-        // Kalshi YES + Poly NO
-        (k_yes, p_no, k_yes_size, p_no_size, ArbType::KalshiYesPolyNo)
-    } else if arb_mask & 4 != 0 {
-        // Poly only (both sides)
-        (p_yes, p_no, p_yes_size, p_no_size, ArbType::PolyOnly)
-    } else if arb_mask & 8 != 0 {
-        // Kalshi only (both sides)
-        (k_yes, k_no, k_yes_size, k_no_size, ArbType::KalshiOnly)
-    } else {
-        return;
-    };
-
-    let req = FastExecutionRequest {
-        market_id,
-        yes_price,
-        no_price,
-        yes_size,
-        no_size,
-        arb_type,
-        detected_ns: clock.now_ns(),
-    };
-
-    // send! ~~
-    let _ = exec_tx.try_send(req);
 }

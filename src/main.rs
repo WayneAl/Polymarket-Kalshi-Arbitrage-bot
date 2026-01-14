@@ -23,32 +23,19 @@
 //! - **Market discovery system** with intelligent caching and incremental updates
 
 mod binance_ws;
-mod cache;
-mod circuit_breaker;
 mod config;
-mod discovery;
-mod execution;
-mod kalshi;
 mod polymarket;
 mod polymarket_clob;
-mod position_tracker;
 mod strategy_0x8dxd;
 mod types;
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, Level};
 
-use cache::TeamCache;
-// use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use config::{ARB_THRESHOLD, ENABLED_LEAGUES, WS_RECONNECT_DELAY_SECS};
-// use discovery::DiscoveryClient;
-// use execution::{create_execution_channel, run_execution_loop, ExecutionEngine};
-// use kalshi::{KalshiApiClient, KalshiConfig};
 use polymarket_clob::{PolymarketAsyncClient, PreparedCreds, SharedAsyncClient};
-// use position_tracker::{create_position_channel, position_writer_loop, PositionTracker};
-use types::{GlobalState, MarketPair, MarketType};
+use types::GlobalState;
 
 /// Polymarket CLOB API host
 const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
@@ -60,18 +47,11 @@ async fn main() -> Result<()> {
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("prediction_market_arbitrage=info".parse().unwrap()),
+            tracing_subscriber::EnvFilter::from_default_env().add_directive(Level::INFO.into()),
         )
         .init();
 
     info!("🚀 Prediction Market Arbitrage System v2.0");
-    info!(
-        "   Profit threshold: <{:.1}¢ ({:.1}% minimum profit)",
-        ARB_THRESHOLD * 100.0,
-        (1.0 - ARB_THRESHOLD) * 100.0
-    );
-    info!("   Monitored leagues: {:?}", ENABLED_LEAGUES);
 
     // Check for dry run mode
     let dry_run = std::env::var("DRY_RUN")
@@ -89,7 +69,7 @@ async fn main() -> Result<()> {
     let poly_funder =
         std::env::var("POLY_FUNDER").context("POLY_FUNDER not set (your wallet address)")?;
 
-    // Create async Polymarket client and derive API credentials
+    // Create async Polymarket client
     info!("[POLYMARKET] Creating async client and deriving API credentials...");
     let poly_async_client = PolymarketAsyncClient::new(
         POLY_CLOB_HOST,
@@ -105,111 +85,129 @@ async fn main() -> Result<()> {
         POLYGON_CHAIN_ID,
     ));
 
-    // Load neg_risk cache from Python script output
-    match poly_async.load_cache(".clob_market_cache.json") {
-        Ok(count) => info!("[POLYMARKET] Loaded {} neg_risk entries from cache", count),
-        Err(e) => warn!("[POLYMARKET] Could not load neg_risk cache: {}", e),
-    }
-
     info!("[POLYMARKET] Client ready for {}", &poly_funder[..10]);
 
-    // Load team code mapping cache
-    let team_cache = TeamCache::load();
-    info!("📂 Loaded {} team code mappings", team_cache.len());
+    // === MAIN SESSION LOOP ===
 
-    // === MARKET DISCOVERY (Polymarket Only) ===
-    info!("🔍 Starting Polymarket-only discovery for 'Bitcoin'...");
+    // Globals
+    let state = Arc::new(tokio::sync::RwLock::new(GlobalState::new()));
+
+    // 2. Initialize Binance Price Feed (One for all strategies)
+    // 2. Initialize Binance Price Feed (One loop, shared history)
+    info!("🚀 Connecting to Binance Stream for [BTC, ETH, SOL, XRP]...");
+    let (binance_client, binance_driver) =
+        crate::binance_ws::BinanceClient::new(crate::binance_ws::BINANCE_WS_URL.to_string());
+
+    // Spawn Binance (forever)
+    tokio::spawn(binance_driver.run());
+
+    // 4. Discovery Setup
     let gamma_client = crate::polymarket::GammaClient::new();
-    let markets = gamma_client.fetch_markets("15M").await?;
 
-    let mut pairs = Vec::new();
-    for market in markets {
-        if let Some(clob_ids_str) = market.clob_token_ids {
-            if let Ok(tokens) = serde_json::from_str::<Vec<String>>(&clob_ids_str) {
-                if tokens.len() >= 2 {
-                    let slug = market.slug.unwrap_or_else(|| "unknown".to_string());
-                    let question = market.question;
+    // Trackers
+    let mut poly_ws_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut active_strategies: std::collections::HashMap<u16, tokio::task::JoinHandle<()>> =
+        std::collections::HashMap::new();
 
-                    // Synthesize a MarketPair
-                    let pair = MarketPair {
-                        pair_id: Arc::from(format!("poly-{}", slug)),
-                        league: Arc::from("crypto".to_string()),
-                        market_type: MarketType::Moneyline, // Defaulting type
-                        description: Arc::from(question),
-                        kalshi_event_ticker: Arc::from("NONE"), // Placeholder
-                        kalshi_market_ticker: Arc::from("NONE"), // Placeholder
-                        poly_slug: Arc::from(slug),
-                        poly_yes_token: Arc::from(tokens[0].clone()),
-                        poly_no_token: Arc::from(tokens[1].clone()),
-                        line_value: None,
-                        team_suffix: None,
-                        expiry_timestamp: market
-                            .end_date_iso
-                            .and_then(|iso| chrono::DateTime::parse_from_rfc3339(&iso).ok())
-                            .map(|dt| dt.timestamp_millis()),
-                    };
-                    pairs.push(pair);
+    let mut init = true;
+
+    loop {
+        // "Use a while init || ... loop" - We integrate this condition into our persistent loop
+        if init || chrono::Local::now().timestamp() % 900 == 0 {
+            init = false;
+            info!("🔄 Starting Discovery (Time: {})", chrono::Local::now());
+
+            // A. Discovery
+            match gamma_client.discover_15m_markets().await {
+                Ok(pairs) => {
+                    info!("🔎 Discovered {} potential markets", pairs.len());
+                    // Add new pairs to global state
+                    let mut s = state.write().await;
+                    let mut added_any = false;
+                    for pair in pairs {
+                        if s.add_pair(pair).is_some() {
+                            added_any = true;
+                        }
+                    }
+
+                    // If markets changed, simple restart of PolyWS to pick up new subscriptions
+                    // (Or if it's the first run)
+                    if added_any || poly_ws_handle.is_none() {
+                        if let Some(h) = poly_ws_handle.take() {
+                            h.abort();
+                        }
+                        let p_state = state.clone();
+                        poly_ws_handle = Some(tokio::spawn(async move {
+                            if let Err(e) = crate::polymarket::run_ws(p_state).await {
+                                warn!("PolyWS exited: {}", e);
+                            }
+                        }));
+                    }
+                }
+                Err(e) => {
+                    error!("Discovery failed: {}", e);
                 }
             }
-        }
-    }
 
-    info!("📊 Market discovery complete:");
-    info!("   - Found {} Bitcoin markets on Polymarket", pairs.len());
+            // B. Spawn/Prune Strategies
+            // Handle cleanup first
+            active_strategies.retain(|id, handle| {
+                if handle.is_finished() {
+                    info!("Strategy {} finished.", id);
+                    false
+                } else {
+                    true
+                }
+            });
 
-    if pairs.is_empty() {
-        error!("No Bitcoin markets found on Polymarket!");
-        return Ok(());
-    }
+            let s = state.read().await;
+            for (id, market) in s.markets.iter().enumerate() {
+                let market_id = id as u16;
 
-    // Build global state
-    let state = Arc::new({
-        let mut s = GlobalState::new();
-        for pair in pairs {
-            s.add_pair(pair);
-        }
-        info!(
-            "📡 Global state initialized: tracking {} markets",
-            s.market_count()
-        );
-        s
-    });
+                // Skip if not set or already running
+                if market.pair.is_none() || active_strategies.contains_key(&market_id) {
+                    continue;
+                }
 
-    // Initialize Binance + 0x8dxd Strategy
-    info!("🚀 Enabling 0x8dxd Latency Arbitrage Strategy (Polymarket Only)");
+                let pair = market.pair.as_ref().unwrap();
+                let desc = pair.description.to_lowercase();
 
-    // Binance WS for price feed
-    let (binance_client, price_rx) = crate::binance_ws::BinanceClient::new();
-    let binance_handle = tokio::spawn(binance_client.run());
+                let asset = if desc.contains("bitcoin") {
+                    Some("BTC")
+                } else if desc.contains("ethereum") {
+                    Some("ETH")
+                } else if desc.contains("solana") {
+                    Some("SOL")
+                } else if desc.contains("ripple") || desc.contains("xrp") {
+                    Some("XRP")
+                } else {
+                    None
+                };
 
-    // 0x8dxd Strategy Engine
-    let strat =
-        crate::strategy_0x8dxd::Strategy0x8dxd::new(state.clone(), poly_async.clone(), price_rx);
-    let strat_handle = tokio::spawn(strat.run(dry_run));
+                if let Some(asset_str) = asset {
+                    info!("✨ Spawning Strategy for {} ({})", pair.pair_id, asset_str);
 
-    // Create dummy channel for Polymarket WS execution (since we don't use the main engine)
-    let (exec_tx, _exec_rx) = tokio::sync::mpsc::channel(1000);
+                    let strat = crate::strategy_0x8dxd::Strategy0x8dxd::new(
+                        state.clone(),
+                        market_id,
+                        asset_str.to_string(),
+                        poly_async.clone(),
+                        binance_client.clone(),
+                    )
+                    .await;
 
-    // Polymarket WS for orderbook updates (required for state update)
-    let poly_state = state.clone();
-    let poly_threshold_dummy = 0; // Not used for threshold checks in this mode logic, just passing through
-    let poly_handle = tokio::spawn(async move {
-        loop {
-            if let Err(e) =
-                crate::polymarket::run_ws(poly_state.clone(), exec_tx.clone(), poly_threshold_dummy)
-                    .await
-            {
-                error!(
-                    "[POLYMARKET] WebSocket disconnected: {} - reconnecting...",
-                    e
-                );
+                    let handle = tokio::spawn(strat.run(dry_run));
+                    active_strategies.insert(market_id, handle);
+                }
             }
-            tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
+
+            // Sleep to ensure we don't spam discovery in the same second
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
         }
-    });
 
-    // Run until termination
-    let _ = tokio::join!(poly_handle, binance_handle, strat_handle);
-
-    Ok(())
+        // Small sleep to prevent busy loop
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
 }
+
+// Remove run_session entirely as its logic is integrated into main

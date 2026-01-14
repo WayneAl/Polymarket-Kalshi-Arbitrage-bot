@@ -15,9 +15,6 @@ pub const POLYMARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/
 /// Gamma API base URL (Polymarket market data)
 pub const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 
-/// Arb threshold: alert when total cost < this (e.g., 0.995 = 0.5% profit)
-pub const ARB_THRESHOLD: f64 = 0.995;
-
 /// Polymarket ping interval (seconds) - keep connection alive
 pub const POLY_PING_INTERVAL_SECS: u64 = 30;
 
@@ -27,9 +24,6 @@ pub const KALSHI_API_DELAY_MS: u64 = 60;
 
 /// WebSocket reconnect delay (seconds)
 pub const WS_RECONNECT_DELAY_SECS: u64 = 5;
-
-/// Which leagues to monitor (empty slice = all)
-pub const ENABLED_LEAGUES: &[&str] = &[];
 
 /// Price logging enabled (set PRICE_LOGGING=1 to enable)
 #[allow(dead_code)]

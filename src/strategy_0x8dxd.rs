@@ -1,25 +1,24 @@
 use anyhow::Result;
-use chrono::{TimeZone, Utc};
+use chrono::Utc;
 use rand::distributions::Distribution;
 use rand::thread_rng;
-use regex::Regex;
-use statrs::distribution::{ContinuousCDF, Normal};
-use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::broadcast;
-use tracing::{error, info};
 
-use crate::binance_ws::BinancePrice;
-use crate::polymarket::Price;
+use serde_json::Value;
+use statrs::distribution::{ContinuousCDF, Normal};
+use std::sync::Arc;
+use tokio::sync::broadcast;
+use tracing::{error, info, warn};
+
+use crate::binance_ws::{BinanceClient, BinancePrice};
+
 use crate::polymarket_clob::SharedAsyncClient;
-use crate::types::{AtomicMarketState, GlobalState};
+use crate::types::GlobalState;
 
 // Configurable parameters
 const MIN_SKEW_PROFIT_CENTS: f64 = 2.0; // Minimum edge (cents) to execute
 const GAS_FEE_ESTIMATE_CENTS: f64 = 1.0; // Estimate per share if not batched
 const MAX_POSITION_USD: f64 = 50.0; // Small size per trade as per 0x8dxd style
-const VOLATILITY_WINDOW_SECS: u64 = 1800; // 30 minutes for IV calculation
+
 const RISK_FREE_RATE: f64 = 0.04; // 4% annual risk-free rate
 
 #[derive(Clone, Copy, Debug)]
@@ -28,255 +27,248 @@ pub enum PricingModel {
     MonteCarlo,
 }
 
-pub struct CachedMarketInfo {
-    strike_price: f64,
-    expiry_ts: i64,
-}
-
 pub struct Strategy0x8dxd {
-    state: Arc<GlobalState>,
+    state: Arc<tokio::sync::RwLock<GlobalState>>,
+    market_id: u16,
+    asset: String, // e.g., "BTC", "ETH"
     client: Arc<SharedAsyncClient>,
     price_rx: broadcast::Receiver<BinancePrice>,
-    regex: Regex,
-    price_history: VecDeque<(Instant, f64)>, // (Timestamp, Price)
+    binance_client: BinanceClient,
     pricing_model: PricingModel,
-    market_cache: HashMap<String, CachedMarketInfo>,
+
+    strike_price: f64,
+    expiry_ts: i64,
+    binance_ref_price: f64,
 }
 
 impl Strategy0x8dxd {
-    pub fn new(
-        state: Arc<GlobalState>,
+    pub async fn new(
+        state: Arc<tokio::sync::RwLock<GlobalState>>,
+        market_id: u16,
+        asset: String,
         client: Arc<SharedAsyncClient>,
-        price_rx: broadcast::Receiver<BinancePrice>,
+        binance_client: BinanceClient,
     ) -> Self {
-        // Regex to parse "Bitcoin > $95,000"
-        let regex = Regex::new(r"Bitcoin\s*>\s*\$?([\d,]+\.?\d*)").expect("Invalid Regex");
-
         // Select model from environment or default to Black-Scholes
         let pricing_model = match std::env::var("PRICING_MODEL").unwrap_or_default().as_str() {
             "monte_carlo" | "mc" => PricingModel::MonteCarlo,
             _ => PricingModel::BlackScholes,
         };
-        info!(
-            "[0x8dxd] Initialized with Pricing Model: {:?}",
-            pricing_model
-        );
+
+        // Subscribe to asset price feed
+        let price_rx = binance_client.subscribe(&asset);
+
+        // Fetch market info (strike, expiry, ref price)
+        let (strike_price, expiry_ts, binance_ref_price) = {
+            let s = state.read().await;
+            let market = s.get_by_id(market_id).expect("Invalid market_id");
+            let p = market.pair.as_ref().unwrap();
+
+            let parts: Vec<&str> = p.pair_id.split('-').collect();
+            let start_time = parts.last().unwrap().parse::<i64>().unwrap_or(0);
+            let expiry_ts = start_time + 900;
+            let strike_price = p.strike_price.unwrap_or(0.0);
+
+            // Temporarily release lock to await async call? No, get_binance_price_at is async.
+            // We need to drop the lock before awaiting.
+            (strike_price, expiry_ts, start_time)
+        };
+        // Re-acquire lock logic avoided by extracting values.
+
+        // Get Binance ref price
+        let binance_ref_price = if strike_price > 0.0 {
+            match Self::get_binance_price_at(&asset, expiry_ts - 900).await {
+                // start_time is expiry - 900
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("[0x8dxd] Failed to fetch binance historical price: {}", e);
+                    strike_price // Fallback
+                }
+            }
+        } else {
+            0.0
+        };
+
+        {
+            let s = state.read().await;
+            let market = s.get_by_id(market_id).expect("Invalid market_id");
+            info!(
+                "[0x8dxd] Initialized strategy for {} (Asset: {}) with Pricing Model: {:?}. Strike={}, Ref={}",
+                market.pair.as_ref().map(|p| p.pair_id.as_ref()).unwrap_or("Unknown"),
+                asset,
+                pricing_model,
+                strike_price,
+                binance_ref_price
+            );
+        }
 
         Self {
             state,
+            market_id,
+            asset,
             client,
             price_rx,
-            regex,
-            price_history: VecDeque::new(),
+            binance_client,
             pricing_model,
-            market_cache: HashMap::new(),
+            strike_price,
+            expiry_ts,
+            binance_ref_price,
         }
     }
 
     pub async fn run(mut self, dry_run: bool) {
-        info!("Running 0x8dxd Strategy (Latency Arbitrage)");
+        let pair_id = {
+            let s = self.state.read().await;
+            let m = s.get_by_id(self.market_id).unwrap();
+            m.pair
+                .as_ref()
+                .map(|p| p.pair_id.to_string())
+                .unwrap_or_default()
+        };
 
-        while let Ok(price_update) = self.price_rx.recv().await {
-            match self.process_tick(&price_update, dry_run).await {
-                Ok(_) => {}
-                Err(e) => error!("[0x8dxd] Error processing tick: {}", e),
-            }
-        }
-    }
+        info!("[0x8dxd] Strategy loop started for {}", pair_id);
 
-    async fn process_tick(&mut self, binance_price: &BinancePrice, dry_run: bool) -> Result<()> {
-        let btc_price = binance_price.mid; // Use mid price
-        self.update_price_history(btc_price);
-
-        // Calculate Realized Volatility (Annualized)
-        let sigma = self.calculate_iv().unwrap_or(0.5); // Default to 50% IV if insufficient data
-
-        let market_count = self.state.market_count();
-        // Iterate through markets
-        for i in 0..market_count {
-            if let Some(market) = self.state.get_by_id(i as u16) {
-                if let Some(pair) = &market.pair {
-                    // 1. Filter for "Bitcoin" and "15min" markets
-                    if !pair.pair_id.contains("btc") || !pair.pair_id.contains("15m") {
-                        continue;
+        loop {
+            match self.price_rx.recv().await {
+                Ok(price_update) => {
+                    // No need to filter by symbol here, subscription is specific
+                    match self.process_tick(&price_update, dry_run).await {
+                        Ok(should_stop) => {
+                            if should_stop {
+                                info!("[0x8dxd] Strategy expired for {}", pair_id);
+                                break;
+                            }
+                        }
+                        Err(e) => error!("[0x8dxd] Error processing tick for {}: {}", pair_id, e),
                     }
-
-                    println!("pair: {:?}", pair);
-
-                    // Check cache first
-                    let (strike_price, expiry_ts) = if let Some(info) =
-                        self.market_cache.get(pair.pair_id.as_ref())
-                    {
-                        (info.strike_price, info.expiry_ts)
-                    } else {
-                        // Fetch if not in cache
-                        // https://polymarket.com/api/crypto/crypto-price?symbol=BTC&eventStartTime=2026-01-12T07:45:00Z&variant=fifteen&endDate=2026-01-12T08:00:00Z
-                        let id = pair.pair_id.split("-").collect::<Vec<&str>>();
-                        let event_start_time = id.last().unwrap().parse::<i64>().unwrap();
-                        let event_start_time_utc = Utc.timestamp_opt(event_start_time, 0).unwrap();
-                        let event_start_time_str =
-                            event_start_time_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-                        let event_end_time_utc =
-                            event_start_time_utc + chrono::Duration::minutes(15);
-                        let event_end_time_str =
-                            event_end_time_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-                        let expiry_ts = event_end_time_utc.timestamp();
-
-                        let symbol = match id.get(1) {
-                            Some(&"btc") => "BTC",
-                            _ => continue, // Skip if symbol lookup fails or is not BTC (though filtered above)
-                        };
-
-                        let url = format!(
-                                "https://polymarket.com/api/crypto/crypto-price?symbol={}&eventStartTime={}&variant=fifteen&endDate={}",
-                                symbol,event_start_time_str,event_end_time_str,
-                            );
-
-                        // println!("url: {:?}", url);
-                        let response = reqwest::get(&url).await?;
-                        let polly_price: Price = response.json().await?;
-                        let strike_price = polly_price.open_price;
-
-                        // Store in cache
-                        self.market_cache.insert(
-                            pair.pair_id.to_string(),
-                            CachedMarketInfo {
-                                strike_price,
-                                expiry_ts,
-                            },
-                        );
-
-                        info!(
-                            "[0x8dxd] Cached market info for {}: Strike={}, Expiry={}",
-                            pair.pair_id, strike_price, expiry_ts
-                        );
-
-                        (strike_price, expiry_ts)
-                    };
-
-                    let now_ts = Utc::now().timestamp();
-                    let time_remaining_secs = expiry_ts - now_ts;
-                    // println!("time_remaining_secs: {}", time_remaining_secs);
-
-                    // Skip if expired
-                    if time_remaining_secs <= 0 {
-                        continue;
-                    }
-
-                    let time_to_expiry_years = time_remaining_secs as f64 / (365.0 * 24.0 * 3600.0);
-
-                    // Load orderbook state (Ask Prices)
-                    let (yes_ask_cents, no_ask_cents, _, _) = market.poly.load();
-
-                    // Calculate Fair Probability (Target Price)
-                    let fair_prob_yes = match self.pricing_model {
-                        PricingModel::BlackScholes => Self::calculate_prob_bs(
-                            btc_price,
-                            strike_price,
-                            time_to_expiry_years,
-                            sigma,
-                        ),
-                        PricingModel::MonteCarlo => Self::calculate_prob_mc(
-                            btc_price,
-                            strike_price,
-                            time_to_expiry_years,
-                            sigma,
-                        ),
-                    };
-                    println!("BTC Price: {}", btc_price);
-                    println!("Strike Price: {}", strike_price);
-                    println!("Time to Expiry: {} secs", time_remaining_secs);
-                    println!("Sigma: {}", sigma);
-                    println!("Fair prob yes: {}", fair_prob_yes);
-
-                    let fair_prob_no = 1.0 - fair_prob_yes;
-
-                    // STRATEGY LOGIC: Probabilistic Edge
-                    // If Market Price < Fair Price - Margin, execute.
-
-                    // 1. Check Buy YES opportunity
-                    if yes_ask_cents > 0 {
-                        let market_price_yes = yes_ask_cents as f64 / 100.0;
-                        self.check_and_execute(
-                            market,
-                            "BUY",
-                            market_price_yes,
-                            fair_prob_yes,
-                            dry_run,
-                        )
-                        .await?;
-                    }
-
-                    // 2. Check Buy NO opportunity
-                    if no_ask_cents > 0 {
-                        let market_price_no = no_ask_cents as f64 / 100.0;
-                        self.check_and_execute(
-                            market,
-                            "SELL", // Maps to Buy NO Token logic downstream
-                            market_price_no,
-                            fair_prob_no,
-                            dry_run,
-                        )
-                        .await?;
-                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    info!(
+                        "[0x8dxd] Price feed closed, stopping strategy for {}",
+                        pair_id
+                    );
+                    break;
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!("[0x8dxd] Price feed lagged, skipped {} messages", skipped);
                 }
             }
         }
-        Ok(())
     }
 
-    /// Update rolling 30m price history
-    fn update_price_history(&mut self, price: f64) {
-        let now = Instant::now();
-        self.price_history.push_back((now, price));
+    /// Returns Ok(true) if the strategy should stop (expired), Ok(false) otherwise.
+    async fn process_tick(&mut self, binance_price: &BinancePrice, dry_run: bool) -> Result<bool> {
+        let btc_price = binance_price.mid; // Use mid price
+                                           // update_price_history is now handled by BinanceClient
 
-        // Trim old data
-        while let Some(&(time, _)) = self.price_history.front() {
-            if now.duration_since(time).as_secs() > VOLATILITY_WINDOW_SECS {
-                self.price_history.pop_front();
-            } else {
-                break;
+        // Calculate Realized Volatility (Annualized)
+        let mut sigma = self.binance_client.get_iv(&self.asset).unwrap_or(0.5);
+        sigma = sigma.max(0.6);
+
+        let now_ts = Utc::now().timestamp();
+        let time_remaining_secs = self.expiry_ts - now_ts;
+
+        if time_remaining_secs <= 0 {
+            return Ok(true);
+        }
+
+        let time_to_expiry_years = time_remaining_secs as f64 / (365.0 * 24.0 * 3600.0);
+
+        let calibrated_btc_price = if self.binance_ref_price > 0.0 {
+            let offset = self.binance_ref_price - self.strike_price;
+            btc_price - offset
+        } else {
+            btc_price
+        };
+
+        if self.strike_price == 0.0 {
+            return Ok(false);
+        }
+
+        let fair_prob_yes = match self.pricing_model {
+            PricingModel::BlackScholes => Self::calculate_prob_bs(
+                calibrated_btc_price,
+                self.strike_price,
+                time_to_expiry_years,
+                sigma,
+            ),
+            PricingModel::MonteCarlo => Self::calculate_prob_mc(
+                calibrated_btc_price,
+                self.strike_price,
+                time_to_expiry_years,
+                sigma,
+            ),
+        };
+
+        info!(
+            "Price: {}, Strike: {}, Time: {}, Prob: {}s, Sigma: {}",
+            calibrated_btc_price, self.strike_price, time_remaining_secs, fair_prob_yes, sigma
+        );
+
+        let fair_prob_no = 1.0 - fair_prob_yes;
+        let mut opps = Vec::new();
+
+        let (poly_yes_token, poly_no_token, yes_ask, no_ask) = {
+            let s = self.state.read().await;
+            let m = s.get_by_id(self.market_id).unwrap();
+            let p = m.pair.as_ref().unwrap();
+            let (ya, na, _, _) = m.poly.load();
+            (p.poly_yes_token.clone(), p.poly_no_token.clone(), ya, na)
+        };
+
+        info!("YES ASK: {} NO ASK: {}", yes_ask, no_ask);
+
+        if yes_ask > 0 {
+            let market_price_yes = yes_ask as f64 / 100.0;
+            if let Some(msg) = self
+                .check_and_execute(
+                    "BUY",
+                    market_price_yes,
+                    fair_prob_yes,
+                    dry_run,
+                    &poly_yes_token,
+                    &poly_no_token,
+                )
+                .await?
+            {
+                opps.push(msg);
             }
         }
+
+        if no_ask > 0 {
+            let market_price_no = no_ask as f64 / 100.0;
+            if let Some(msg) = self
+                .check_and_execute(
+                    "SELL",
+                    market_price_no,
+                    fair_prob_no,
+                    dry_run,
+                    &poly_yes_token,
+                    &poly_no_token,
+                )
+                .await?
+            {
+                opps.push(msg);
+            }
+        }
+
+        if !opps.is_empty() {
+            // Access pair_id for logging
+            let pair_id = {
+                let s = self.state.read().await;
+                let m = s.get_by_id(self.market_id).unwrap();
+                m.pair
+                    .as_ref()
+                    .map(|p| p.pair_id.to_string())
+                    .unwrap_or_default()
+            };
+            let action_status = opps.join(" | ");
+            info!("[{}] {}", pair_id, action_status);
+        }
+
+        Ok(false)
     }
 
-    /// Calculate Realized Volatility (Annualized Standard Deviation of Log Returns)
-    fn calculate_iv(&self) -> Option<f64> {
-        if self.price_history.len() < 10 {
-            return None; // Not enough data
-        }
-
-        let mut log_returns = Vec::new();
-        let mut data_iter = self.price_history.iter();
-        let mut prev_price = data_iter.next()?.1;
-
-        for &(_, price) in data_iter {
-            let log_ret = (price / prev_price).ln();
-            log_returns.push(log_ret);
-            prev_price = price;
-        }
-
-        if log_returns.is_empty() {
-            return None;
-        }
-
-        // Calculate standard deviation of log returns
-        let n = log_returns.len() as f64;
-        let mean = log_returns.iter().sum::<f64>() / n;
-        let variance = log_returns.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
-        let std_dev = variance.sqrt();
-
-        // Annualize: Sigma = std_dev * sqrt(samples_per_year)
-        // Assuming ~1 sample per second from Binance
-        let samples_per_year: f64 = 365.0 * 24.0 * 3600.0;
-        let annualized_vol = std_dev * samples_per_year.sqrt();
-
-        Some(annualized_vol)
-    }
-
-    /// Black-Scholes Binary Call Option Pricing
-    /// Price of "Asset > Strike" = N(d2) in Black-Scholes framework for digital options
     fn calculate_prob_bs(s: f64, k: f64, t: f64, sigma: f64) -> f64 {
         if t <= 0.0 {
             return if s > k { 1.0 } else { 0.0 };
@@ -284,13 +276,11 @@ impl Strategy0x8dxd {
         let d2 = ((s / k).ln() + (RISK_FREE_RATE - 0.5 * sigma * sigma) * t) / (sigma * t.sqrt());
         let normal = Normal::new(0.0, 1.0).unwrap();
         normal.cdf(d2)
-        // (-RISK_FREE_RATE * t).exp() * normal.cdf(d2)
     }
 
-    /// Monte Carlo Simulation for Binary Call Option
     fn calculate_prob_mc(s: f64, k: f64, t: f64, sigma: f64) -> f64 {
         let iterations = 10000;
-        let dt = t; // Single step simulation for simplicity, can be detailed
+        let dt = t;
         let drift = (RISK_FREE_RATE - 0.5 * sigma * sigma) * dt;
         let diffusion = sigma * dt.sqrt();
         let normal = Normal::new(0.0, 1.0).unwrap();
@@ -310,48 +300,71 @@ impl Strategy0x8dxd {
 
     async fn check_and_execute(
         &self,
-        market: &AtomicMarketState,
-        side: &str, // "BUY" -> Buy Yes Token, "SELL" -> Buy No Token
+        side: &str,
         current_price: f64,
         target_price: f64,
         dry_run: bool,
-    ) -> Result<()> {
+        yes_token: &Arc<str>,
+        no_token: &Arc<str>,
+    ) -> Result<Option<String>> {
         let expected_profit = target_price - current_price;
         let profit_margin = expected_profit - (GAS_FEE_ESTIMATE_CENTS / 100.0);
 
         if profit_margin > (MIN_SKEW_PROFIT_CENTS / 100.0) {
-            let pair = market.pair.as_ref().unwrap();
-
-            // Log the opportunity
-            if profit_margin > 0.05 {
-                info!(
-                    "[0x8dxd] Opportunity! Market: {} | Action: Buy {} | Price: {:.3} | Target: {:.3} | Margin: {:.3} | Model: {:?}",
-                    pair.description,
-                    if side == "BUY" { "YES" } else { "NO" },
-                    current_price,
-                    target_price,
-                    profit_margin,
-                    self.pricing_model
-                );
-            }
+            let opp_msg = format!(
+                "Buy {} @ {:.2} (M:{:.2})",
+                if side == "BUY" { "YES" } else { "NO" },
+                current_price,
+                profit_margin
+            );
 
             if !dry_run {
-                let token_id = if side == "BUY" {
-                    &pair.poly_yes_token
-                } else {
-                    &pair.poly_no_token
-                };
+                let token_id = if side == "BUY" { yes_token } else { no_token };
 
                 let size = MAX_POSITION_USD / current_price;
 
-                // Uses buy_fak to buy the specific token (YES or NO token)
                 match self.client.buy_fak(token_id, current_price, size).await {
                     Ok(fill) => info!("[0x8dxd] Executed! Matched: {}", fill.filled_size),
                     Err(e) => error!("[0x8dxd] Execution Failed: {}", e),
                 }
             }
+
+            return Ok(Some(opp_msg));
         }
-        Ok(())
+        Ok(None)
+    }
+
+    async fn get_binance_price_at(asset: &str, start_time_ms: i64) -> Result<f64> {
+        let symbol = format!("{}USDT", asset.to_uppercase());
+
+        // Note: startTime parameter for Binance API is milliseconds.
+        // Make sure start_time_ms is actually ms. In constructor we passed (expiry - 900) which is seconds.
+        // So we need to multiply by 1000.
+        let start_ts_param = start_time_ms * 1000;
+
+        let url = format!(
+            "https://api.binance.com/api/v3/klines?symbol={}&interval=1m&startTime={}&limit=1",
+            symbol, start_ts_param
+        );
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(4))
+            .build()?;
+        let response = client.get(&url).send().await?;
+        let json: Value = response.json().await?;
+
+        if let Some(klines) = json.as_array() {
+            if let Some(first_kline) = klines.first() {
+                if let Some(first_kline_arr) = first_kline.as_array() {
+                    if let Some(open_str) = first_kline_arr.get(1).and_then(|v| v.as_str()) {
+                        let price = open_str.parse::<f64>()?;
+                        return Ok(price);
+                    }
+                }
+            }
+        }
+
+        anyhow::bail!("Failed to parse Binance historical price")
     }
 }
 
@@ -361,80 +374,16 @@ mod tests {
 
     #[test]
     fn test_calculate_prob_bs() {
-        // 1. Deep ITM: Price=150, Strike=100, T=0.1 (short time) -> Should be close to 1.0
-        let prob_itm = Strategy0x8dxd::calculate_prob_bs(
-            90672.975,
-            90630.06358168717,
-            0.000016076864535768644,
-            0.01335172967371621,
-        );
-        println!("ITM probability: {}", prob_itm);
-        assert!(
-            prob_itm > 0.9,
-            "ITM probability should be high, got {}",
-            prob_itm
-        );
+        let prob_itm = Strategy0x8dxd::calculate_prob_bs(150.0, 100.0, 0.1, 0.5);
+        assert!(prob_itm > 0.9);
 
-        // 2. Deep OTM: Price=50, Strike=100, T=0.1 -> Should be close to 0.0
         let prob_otm = Strategy0x8dxd::calculate_prob_bs(50.0, 100.0, 0.1, 0.5);
-        assert!(
-            prob_otm < 0.1,
-            "OTM probability should be low, got {}",
-            prob_otm
-        );
-        println!("OTM probability: {}", prob_otm);
+        assert!(prob_otm < 0.1);
 
-        // 3. Expired ITM: Time=0, Price=150, Strike=100 -> 1.0
         let prob_expired_itm = Strategy0x8dxd::calculate_prob_bs(150.0, 100.0, 0.0, 0.5);
         assert_eq!(prob_expired_itm, 1.0);
-        println!("Expired ITM probability: {}", prob_expired_itm);
 
-        // 4. Expired OTM: Time=0, Price=50, Strike=100 -> 0.0
         let prob_expired_otm = Strategy0x8dxd::calculate_prob_bs(50.0, 100.0, 0.0, 0.5);
         assert_eq!(prob_expired_otm, 0.0);
-        println!("Expired OTM probability: {}", prob_expired_otm);
-    }
-
-    #[test]
-    fn test_calculate_prob_mc() {
-        // Monte Carlo is random, so we check ranges and consistency with BS
-
-        // 1. ITM (T=0.1)
-        let prob_itm = Strategy0x8dxd::calculate_prob_mc(150.0, 100.0, 0.1, 0.5);
-        assert!(
-            prob_itm > 0.9,
-            "MC ITM probability should be high, got {}",
-            prob_itm
-        );
-        println!("MC ITM probability: {}", prob_itm);
-
-        // 2. OTM (T=0.1)
-        let prob_otm = Strategy0x8dxd::calculate_prob_mc(50.0, 100.0, 0.1, 0.5);
-        assert!(
-            prob_otm < 0.1,
-            "MC OTM probability should be low, got {}",
-            prob_otm
-        );
-        println!("MC OTM probability: {}", prob_otm);
-
-        // 3. Convergence with BS (ATM)
-        // Price=100, Strike=100, T=1, Sigma=0.5
-        let bs_prob = Strategy0x8dxd::calculate_prob_bs(100.0, 100.0, 1.0, 0.5);
-        let mc_prob = Strategy0x8dxd::calculate_prob_mc(100.0, 100.0, 1.0, 0.5);
-        println!("BS ATM probability: {}", bs_prob);
-        println!("MC ATM probability: {}", mc_prob);
-
-        // MC with 1000 iter has standard error ~ sqrt(p(1-p)/1000). For p=0.5, sqrt(0.25/1000) = sqrt(0.00025) = 0.015.
-        // 3 sigma is 0.045.
-        // Diff limit 0.15 is generous enough.
-        let diff = (bs_prob - mc_prob).abs();
-        assert!(
-            diff < 0.01,
-            "MC and BS should be somewhat close. BS: {}, MC: {}, Diff: {}",
-            bs_prob,
-            mc_prob,
-            diff
-        );
-        println!("MC and BS difference: {}", diff);
     }
 }

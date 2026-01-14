@@ -598,6 +598,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
+name = "crossterm"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f476fe445d41c9e991fd07515a6f463074b782242ccf4a5b7b1d1012e70824df"
+dependencies = [
+ "bitflags 2.10.0",
+ "crossterm_winapi",
+ "libc",
+ "mio 0.8.11",
+ "parking_lot",
+ "signal-hook",
+ "signal-hook-mio",
+ "winapi",
+]
+
+[[package]]
+name = "crossterm_winapi"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acdd7c62a3665c7f6830a51635d9ac9b23ed385797f70a83bb8bafe9c572ab2b"
+dependencies = [
+ "winapi",
+]
+
+[[package]]
 name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -660,7 +685,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid",
- "pem-rfc7468",
  "zeroize",
 ]
 
@@ -1999,9 +2023,6 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
-dependencies = [
- "spin 0.9.8",
-]
 
 [[package]]
 name = "libc"
@@ -2105,6 +2126,18 @@ dependencies = [
 
 [[package]]
 name = "mio"
+version = "0.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4a650543ca06a924e8b371db273b2756685faae30f8487da1b56505a8f78b0c"
+dependencies = [
+ "libc",
+ "log",
+ "wasi",
+ "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "mio"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a69bcab0ad47271a0234d9422b131806bf3968021e5dc9328caf2d4cd58557fc"
@@ -2198,22 +2231,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "num-bigint-dig"
-version = "0.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e661dda6640fad38e827a6d4a310ff4763082116fe217f279885c97f511bb0b7"
-dependencies = [
- "lazy_static",
- "libm",
- "num-integer",
- "num-iter",
- "num-traits",
- "rand 0.8.5",
- "smallvec",
- "zeroize",
-]
-
-[[package]]
 name = "num-complex"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2234,17 +2251,6 @@ version = "0.1.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7969661fd2958a5cb096e56c8e1ad0444ac2bbcd0061bd28660485a44879858f"
 dependencies = [
- "num-traits",
-]
-
-[[package]]
-name = "num-iter"
-version = "0.1.45"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1429034a0490724d0075ebb2bc9e875d6503c3cf69e235a8941aa757d83ef5bf"
-dependencies = [
- "autocfg",
- "num-integer",
  "num-traits",
 ]
 
@@ -2493,15 +2499,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pem-rfc7468"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88b39c9bfcfc231068454382784bb460aae594343fb030d46e9f50a645418412"
-dependencies = [
- "base64ct",
-]
-
-[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2602,17 +2599,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
-name = "pkcs1"
-version = "0.7.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8ffb9f10fa047879315e6625af03c164b16962a5368d724ed16323b68ace47f"
-dependencies = [
- "der",
- "pkcs8",
- "spki",
-]
-
-[[package]]
 name = "pkcs8"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2701,6 +2687,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "criterion",
+ "crossterm",
  "dotenvy",
  "ethers",
  "futures-util",
@@ -2708,11 +2695,9 @@ dependencies = [
  "hex",
  "hmac",
  "nonzero_ext",
- "pkcs1",
  "rand 0.8.5",
  "regex",
  "reqwest",
- "rsa",
  "rustc-hash",
  "serde",
  "serde_json",
@@ -2723,7 +2708,6 @@ dependencies = [
  "tokio-tungstenite 0.21.0",
  "tracing",
  "tracing-subscriber",
- "wide",
 ]
 
 [[package]]
@@ -3044,7 +3028,7 @@ dependencies = [
  "cc",
  "libc",
  "once_cell",
- "spin 0.5.2",
+ "spin",
  "untrusted 0.7.1",
  "web-sys",
  "winapi",
@@ -3093,27 +3077,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
-]
-
-[[package]]
-name = "rsa"
-version = "0.9.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40a0376c50d0358279d9d643e4bf7b7be212f1f4ff1da9070a7b54d22ef75c88"
-dependencies = [
- "const-oid",
- "digest",
- "num-bigint-dig",
- "num-integer",
- "num-traits",
- "pkcs1",
- "pkcs8",
- "rand_core 0.6.4",
- "sha2",
- "signature",
- "spki",
- "subtle",
- "zeroize",
 ]
 
 [[package]]
@@ -3452,6 +3415,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook-mio"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b75a19a7a740b25bc7944bdee6172368f988763b744e3d4dfe753f6b4ece40cc"
+dependencies = [
+ "libc",
+ "mio 0.8.11",
+ "signal-hook",
+]
+
+[[package]]
 name = "signal-hook-registry"
 version = "1.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3558,12 +3542,6 @@ name = "spin"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e63cff320ae2c57904679ba7cb63280a3dc4613885beafb148ee7bf9aa9042d"
-
-[[package]]
-name = "spin"
-version = "0.9.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
 name = "spinning_top"
@@ -3891,7 +3869,7 @@ checksum = "ff360e02eab121e0bc37a2d3b4d4dc622e6eda3a8e5253d5435ecf5bd4c68408"
 dependencies = [
  "bytes",
  "libc",
- "mio",
+ "mio 1.1.1",
  "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
