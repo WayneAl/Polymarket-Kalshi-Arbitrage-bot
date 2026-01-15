@@ -184,7 +184,7 @@ pub struct AssetConfig {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
-    // pub polygon_ws_url: Option<String>, // Deprecated for Data API
+    pub polygon_ws_url: Option<String>,
     pub active_strategy: Option<StrategyType>,
     pub copy_trade: Option<CopyTradeConfig>,
     pub assets: Vec<AssetConfig>,

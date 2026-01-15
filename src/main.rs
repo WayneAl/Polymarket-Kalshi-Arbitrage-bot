@@ -28,6 +28,7 @@ mod polymarket;
 mod polymarket_clob;
 mod strategy_0x8dxd;
 mod strategy_copy_trade;
+mod strategy_copy_trade_ws;
 mod types;
 
 use anyhow::{Context, Result};
