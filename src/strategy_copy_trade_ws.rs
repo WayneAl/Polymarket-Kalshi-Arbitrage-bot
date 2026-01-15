@@ -25,7 +25,7 @@ const CTF_EXCHANGE_ADDR: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
 abigen!(
     CtfExchange,
     r#"[
-        event OrderFilled(bytes32 indexed orderHash, address indexed maker, address indexed taker, uint256 makerFillAmount, uint256 takerFillAmount, uint256 fee)
+        event OrderFilled(bytes32 indexed orderHash, address indexed maker, address indexed taker, uint256 makerAssetId, uint256 takerAssetId, uint256 makerAmountFilled, uint256 takerAmountFilled, uint256 fee)
     ]"#
 );
 
@@ -105,8 +105,8 @@ impl StrategyCopyTradeWS {
                 if is_maker || is_taker {
                     let tx_hash = log.transaction_hash.unwrap_or_default();
                     info!(
-                        "[CopyTradeWS] 🚨 TRADE DETECTED! Tx: {:?} | Maker: {:?} | Taker: {:?}",
-                        tx_hash, event.maker, event.taker
+                        "[CopyTradeWS] 🚨 TRADE DETECTED! Tx: {:?} | Maker: {:?} | Taker: {:?} | MakerAsset: {} | TakerAsset: {}",
+                        tx_hash, event.maker, event.taker, event.maker_asset_id, event.taker_asset_id
                     );
 
                     // Speed comparison output helper

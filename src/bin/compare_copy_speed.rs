@@ -96,9 +96,9 @@ async fn main() -> Result<()> {
 
     // Run both
     tokio::select! {
-        // _ = api_strategy.run(true) => {
-        //     info!("API Strategy exited");
-        // }
+        _ = api_strategy.run(true) => {
+            info!("API Strategy exited");
+        }
         _ = ws_strategy.run(true) => {
              info!("WS Strategy exited");
         }
