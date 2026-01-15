@@ -96,7 +96,7 @@ impl StrategyCopyTradeWS {
         info!("[CopyTradeWS] Listening for trades...");
 
         while let Some(log) = stream.next().await {
-            println!("[CopyTradeWS] Log received: {:?}", log);
+            // println!("[CopyTradeWS] Log received: {:?}", log);
             // Parse event
             if let Ok(event) = ethers::contract::parse_log::<OrderFilledFilter>(log.clone()) {
                 let is_maker = event.maker == target_addr;
@@ -104,19 +104,14 @@ impl StrategyCopyTradeWS {
 
                 if is_maker || is_taker {
                     let tx_hash = log.transaction_hash.unwrap_or_default();
+                    let size =
+                        U256::from(event.taker_amount_filled).as_u64() as f64 / 10_f64.powi(6);
+                    let usdc =
+                        U256::from(event.maker_amount_filled).as_u64() as f64 / 10_f64.powi(6);
+                    let price = usdc / size;
                     info!(
-                        "[CopyTradeWS] 🚨 TRADE DETECTED! Tx: {:?} | Maker: {:?} | Taker: {:?} | MakerAsset: {} | TakerAsset: {}",
-                        tx_hash, event.maker, event.taker, event.maker_asset_id, event.taker_asset_id
-                    );
-
-                    // Speed comparison output helper
-                    println!(
-                        "SPEED_COMPARE_WS:{} detected at {:?}",
-                        tx_hash,
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis()
+                        "[CopyTradeWS] 🚨 TRADE DETECTED! Tx: {:?} | {} with {} USDC @ {} ",
+                        tx_hash, size, usdc, price
                     );
 
                     if !dry_run {

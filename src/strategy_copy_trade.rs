@@ -139,8 +139,8 @@ impl StrategyCopyTrade {
 
     async fn process_trade(&self, trade: &ActivityItem, dry_run: bool) {
         info!(
-            "[CopyTrade] 🔔 New Trade Detected: {} {} {} on {}",
-            trade.side, trade.size, trade.asset, trade.title
+            "[CopyTrade] 🔔 New Trade Detected: {} {} {} on {} @ {:?} with {:?} USDC",
+            trade.side, trade.size, trade.asset, trade.title, trade.price, trade.usdc_size
         );
 
         let token_id_u256 = U256::from_dec_str(&trade.asset).unwrap_or(U256::zero());
@@ -168,10 +168,10 @@ impl StrategyCopyTrade {
                 }
             }
         } else {
-            warn!(
-                "[CopyTrade] ⚠️ Could not match token ID {} to any known market.",
-                trade.asset
-            );
+            // warn!(
+            //     "[CopyTrade] ⚠️ Could not match token ID {} to any known market.",
+            //     trade.asset
+            // );
         }
     }
 
