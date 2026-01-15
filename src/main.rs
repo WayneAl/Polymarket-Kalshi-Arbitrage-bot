@@ -27,6 +27,7 @@ mod config;
 mod polymarket;
 mod polymarket_clob;
 mod strategy_0x8dxd;
+mod strategy_copy_trade;
 mod types;
 
 use anyhow::{Context, Result};
@@ -204,17 +205,43 @@ async fn main() -> Result<()> {
                         pair.pair_id, asset_cfg.symbol
                     );
 
-                    let strat = crate::strategy_0x8dxd::Strategy0x8dxd::new(
-                        state.clone(),
-                        market_id,
-                        asset_cfg.symbol.clone(),
-                        asset_cfg.default_sigma, // Pass configured default sigma
-                        poly_async.clone(),
-                        binance_client.clone(),
-                    )
-                    .await;
+                    let strategy_type = config
+                        .active_strategy
+                        .clone()
+                        .unwrap_or(crate::config::StrategyType::Strategy0x8dxd);
 
-                    let handle = tokio::spawn(strat.run(dry_run));
+                    let handle = match strategy_type {
+                        crate::config::StrategyType::Strategy0x8dxd => {
+                            let strat = crate::strategy_0x8dxd::Strategy0x8dxd::new(
+                                state.clone(),
+                                market_id,
+                                asset_cfg.symbol.clone(),
+                                asset_cfg.default_sigma,
+                                poly_async.clone(),
+                                binance_client.clone(),
+                            )
+                            .await;
+                            tokio::spawn(strat.run(dry_run))
+                        }
+                        crate::config::StrategyType::CopyTrade => {
+                            let target = config
+                                .copy_trade
+                                .as_ref()
+                                .map(|c| c.target_address.clone())
+                                .expect("CopyTrade active but config missing");
+
+                            // Refactored to use API polling
+                            let strat = crate::strategy_copy_trade::StrategyCopyTrade::new(
+                                state.clone(),
+                                market_id,
+                                target,
+                                poly_async.clone(),
+                            )
+                            .await;
+                            tokio::spawn(strat.run(dry_run))
+                        }
+                    };
+
                     active_strategies.insert(market_id, handle);
                 }
             }

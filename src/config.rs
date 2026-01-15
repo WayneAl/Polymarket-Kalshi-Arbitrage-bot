@@ -184,7 +184,22 @@ pub struct AssetConfig {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
+    // pub polygon_ws_url: Option<String>, // Deprecated for Data API
+    pub active_strategy: Option<StrategyType>,
+    pub copy_trade: Option<CopyTradeConfig>,
     pub assets: Vec<AssetConfig>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyType {
+    Strategy0x8dxd,
+    CopyTrade,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CopyTradeConfig {
+    pub target_address: String,
 }
 
 pub fn load_config(path: &str) -> anyhow::Result<Config> {
