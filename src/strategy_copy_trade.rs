@@ -203,6 +203,7 @@ impl StrategyCopyTrade {
 mod tests {
     use super::*;
     use crate::polymarket_clob::{ApiCreds, PolymarketAsyncClient, PreparedCreds};
+    use anyhow::Context;
     use base64::Engine;
     use ethers::signers::LocalWallet;
 
@@ -274,5 +275,150 @@ mod tests {
                 panic!("fetch_activity method failed: {}", e);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_process_trade_buy_fak_exact_log() {
+        // Setup Dummy Client
+        let wallet = LocalWallet::new(&mut rand::thread_rng());
+        let private_key = format!("0x{}", hex::encode(wallet.signer().to_bytes()));
+
+        let api_creds = ApiCreds {
+            api_key: "test_key".to_string(),
+            api_secret: base64::engine::general_purpose::URL_SAFE.encode(
+                "test_secret_must_be_long_enough_for_hmac_32_bytes_at_least_so_lets_make_it_so",
+            ),
+            api_passphrase: "test_pass".to_string(),
+        };
+        let creds = PreparedCreds::from_api_creds(&api_creds).expect("Failed to prepare creds");
+
+        let poly_client = PolymarketAsyncClient::new(
+            "https://clob.polymarket.com",
+            137,
+            &private_key,
+            "0x0000000000000000000000000000000000000000",
+        )
+        .expect("Failed to create poly client");
+
+        let shared_client = Arc::new(SharedAsyncClient::new(poly_client, creds, 137));
+
+        // Construct Strategy with populating market state
+        let mut global_state = GlobalState::default();
+
+        // Exact token ID from the user request
+        let target_token_id =
+            "45754504545215212829990986490491189267238445096874557569742978594673352051621";
+
+        // Create a dummy market with this token as YES token
+        // The other fields can be dummy values
+        let pair = crate::types::MarketPair {
+            pair_id: "test_pair".into(),
+            market_type: crate::types::MarketType::Moneyline,
+            description: "XRP Up or Down - January 15, 3AM ET".into(),
+            poly_slug: "xrp-up-down-jan-15".into(),
+            poly_yes_token: target_token_id.into(),
+            poly_no_token: "123456789012345678901234567890123456789".into(), // Different ID
+            strike_price: None,
+            expiry_timestamp: None,
+        };
+
+        global_state.add_pair(pair);
+
+        let state = Arc::new(RwLock::new(global_state));
+        let target_address = "0x63ce342161250d705dc0b16df89036c8e5f9ba9a".to_string();
+
+        let strategy = StrategyCopyTrade {
+            state: state.clone(),
+            _market_id: 1,
+            target_address: target_address.clone(),
+            client: shared_client.clone(),
+            http: reqwest::Client::new(),
+        };
+
+        // Construct the trade activity based on user log
+        // BUY 120 ... @ Some(0.3)
+        let trade = ActivityItem {
+            activity_type: "TRADE".to_string(),
+            timestamp: 1234567890,
+            side: "BUY".to_string(),
+            size: 120.0,
+            asset: target_token_id.to_string(),
+            transaction_hash: "0xhash".to_string(),
+            title: "XRP Up or Down".to_string(),
+            price: Some(0.3),
+            usdc_size: Some(36.0), // 120 * 0.3
+        };
+
+        println!("Testing process_trade with exact log replication...");
+
+        // We expect this to identify the token and try to execute a BUY order
+        // usage of dry_run=false to try to hit the client code path (it will fail on network obviously)
+        // But we want to see the logs: "[CopyTrade] 🎯 Matched Market Token!" and "[CopyTrade] Executing BUY..."
+        strategy.process_trade(&trade, false).await;
+
+        println!("Test finished. Check logs for '🎯 Matched Market Token!' and 'Executing BUY'");
+    }
+
+    #[tokio::test]
+    async fn test_real_wallet_buy_fak() -> Result<()> {
+        // Load .env
+        match dotenvy::dotenv() {
+            Ok(path) => println!(".env loaded from: {:?}", path),
+            Err(e) => println!("Failed to load .env: {:?}", e),
+        }
+        println!("Current Dir: {:?}", std::env::current_dir());
+        // Load Credentials from Env
+        dotenvy::dotenv().ok();
+        let poly_private_key =
+            std::env::var("POLY_PRIVATE_KEY").context("POLY_PRIVATE_KEY not set")?;
+        let poly_funder = std::env::var("POLY_FUNDER").context("POLY_FUNDER not set")?;
+
+        // Create Client
+        info!("Creating Polymarket Client...");
+        // 137 for Polygon
+        let poly_client = PolymarketAsyncClient::new(
+            "https://clob.polymarket.com",
+            137,
+            &poly_private_key,
+            &poly_funder,
+        )?;
+
+        println!(
+            "Polymarket Client: {:?} | Funder: {:?}",
+            poly_client.wallet_address(),
+            poly_client.funder()
+        );
+
+        let api_creds = poly_client.derive_api_key(0).await?;
+        println!("API Creds: {:?}", api_creds);
+        let prepared_creds = PreparedCreds::from_api_creds(&api_creds)?;
+
+        println!("Prepared Creds: {:?}", prepared_creds.api_key);
+
+        let shared_client = Arc::new(SharedAsyncClient::new(poly_client, prepared_creds, 137));
+
+        let token_id =
+            "110590257594025543791099363259873209470145366298239188873126853145702938170464";
+        let price = 0.51;
+        let size = 5.0;
+
+        println!(
+            "Executing BUY FAK >> Token: {} | Price: {} | Size: {}",
+            token_id, price, size
+        );
+
+        // Execute BUY FAK
+        match shared_client.buy_fak(token_id, price, size).await {
+            Ok(fill) => {
+                println!("✅ Order Successful!");
+                println!("Order ID: {}", fill.order_id);
+                println!("Filled Size: {}", fill.filled_size);
+                println!("Fill Cost: {}", fill.fill_cost);
+            }
+            Err(e) => {
+                panic!("❌ Order Failed: {:?}", e);
+            }
+        }
+        Ok(())
     }
 }
