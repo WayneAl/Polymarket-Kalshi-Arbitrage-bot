@@ -100,22 +100,25 @@ impl StrategyCopyTradeWS {
             // Parse event
             if let Ok(event) = ethers::contract::parse_log::<OrderFilledFilter>(log.clone()) {
                 let is_maker = event.maker == target_addr;
-                let is_taker = event.taker == target_addr;
+                // let is_taker = event.taker == target_addr;
 
-                if is_maker || is_taker {
-                    let tx_hash = log.transaction_hash.unwrap_or_default();
+                if is_maker {
+                    // let tx_hash = log.transaction_hash.unwrap_or_default();
                     let size =
                         U256::from(event.taker_amount_filled).as_u64() as f64 / 10_f64.powi(6);
                     let usdc =
                         U256::from(event.maker_amount_filled).as_u64() as f64 / 10_f64.powi(6);
                     let price = usdc / size;
                     info!(
-                        "[CopyTradeWS] 🚨 TRADE DETECTED! Tx: {:?} | {} with {} USDC @ {} ",
-                        tx_hash, size, usdc, price
+                        "[CopyTradeWS] 🚨 TRADE DETECTED! BUY {} with {} USDC @ {} ",
+                        size, usdc, price
                     );
 
                     if !dry_run {
-                        // Logic to fetch receipt and trade would go here.
+                        let _ = self
+                            .client
+                            .buy_fak(&event.taker_asset_id.to_string(), price, size)
+                            .await;
                     }
                 }
             }
