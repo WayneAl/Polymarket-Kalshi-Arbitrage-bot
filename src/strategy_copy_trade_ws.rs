@@ -14,6 +14,8 @@ use crate::types::GlobalState;
 // CTF Exchange Contract Address (Polygon)
 const CTF_EXCHANGE_ADDR: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
 
+// const ws = new WebSocket("wss://ws-subscriptions-clob.polymarket.com/ws/market");
+
 // Event signature for OrderFilled
 // event OrderFilled(bytes32 indexed orderHash, address indexed maker, address indexed taker, uint256 makerFillAmount, uint256 takerFillAmount, uint256 fee)
 // However, checking previous implementation, we likely used a broad filter.
@@ -109,16 +111,35 @@ impl StrategyCopyTradeWS {
                     let usdc =
                         U256::from(event.maker_amount_filled).as_u64() as f64 / 10_f64.powi(6);
                     let price = usdc / size;
+                    let fee = if U256::from(event.fee).as_u64() > 0 {
+                        true
+                    } else {
+                        false
+                    };
                     info!(
                         "[CopyTradeWS] 🚨 TRADE DETECTED! BUY {} with {} USDC @ {} ",
                         size, usdc, price
                     );
 
                     if !dry_run {
-                        let _ = self
-                            .client
-                            .buy_fak(&event.taker_asset_id.to_string(), price, size)
-                            .await;
+                        if size >= 1.0 && usdc >= 1.0 {
+                            let fill = self
+                                .client
+                                .buy_fak(&event.taker_asset_id.to_string(), price, size, fee)
+                                .await;
+                            if let Err(e) = fill {
+                                // not enough balance => stop
+                                if e.to_string().contains("insufficient balance") {
+                                    warn!(
+                                        "[CopyTradeWS] 🚨 INSUFFICIENT BALANCE to fill trade, stopping strategy."
+                                    );
+                                    break;
+                                }
+                                error!("[CopyTradeWS] 🚨 TRADE FILL ERROR: {}", e);
+                            } else {
+                                info!("[CopyTradeWS] 🚨 TRADE FILL: {:?}", fill);
+                            }
+                        }
                     }
                 }
             }

@@ -84,11 +84,16 @@ async fn main() -> Result<()> {
     let poly_private_key = std::env::var("POLY_PRIVATE_KEY").context("POLY_PRIVATE_KEY not set")?;
     let poly_funder =
         std::env::var("POLY_FUNDER").context("POLY_FUNDER not set (your wallet address)")?;
+    // Fallback or require RPC URL
+    let rpc_url = std::env::var("POLYGON_RPC_URL")
+        .or_else(|_| std::env::var("POLYGON_WS_URL"))
+        .context("POLYGON_RPC_URL or POLYGON_WS_URL not set")?;
 
     // Create async Polymarket client
     info!("[POLYMARKET] Creating async client and deriving API credentials...");
     let poly_async_client = PolymarketAsyncClient::new(
         POLY_CLOB_HOST,
+        &rpc_url,
         POLYGON_CHAIN_ID,
         &poly_private_key,
         &poly_funder,

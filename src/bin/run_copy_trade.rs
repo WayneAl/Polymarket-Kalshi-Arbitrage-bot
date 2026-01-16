@@ -38,11 +38,14 @@ async fn main() -> Result<()> {
     let poly_funder = std::env::var("POLY_FUNDER").context("POLY_FUNDER not set")?;
     let target_address = std::env::var("TARGET_ADDRESS").context("TARGET_ADDRESS not set")?;
     let ws_url = std::env::var("POLYGON_WS_URL").context("POLYGON_WS_URL not set")?;
+    // Fallback to WS URL if RPC URL is not set (many providers support both on same URL, or user can set distinct)
+    let rpc_url = std::env::var("POLYGON_RPC_URL").unwrap_or_else(|_| ws_url.clone());
 
     // Create Async Client
     info!("[POLYMARKET] Creating async client...");
     let poly_async_client = PolymarketAsyncClient::new(
         POLY_CLOB_HOST,
+        &rpc_url,
         POLYGON_CHAIN_ID,
         &poly_private_key,
         &poly_funder,

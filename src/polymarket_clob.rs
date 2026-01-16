@@ -24,6 +24,17 @@ const USER_AGENT: &str = "py_clob_client";
 const MSG_TO_SIGN: &str = "This message attests that I control the given wallet";
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
+// Polygon Mainnet Constants
+const CTF_EXCHANGE_ADDR: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
+const USDC_E_ADDR: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+
+use ethers::abi::{encode, Token};
+use ethers::middleware::SignerMiddleware;
+use ethers::prelude::*;
+use ethers::providers::{Http, Middleware, Provider};
+use ethers::types::transaction::eip2718::TypedTransaction;
+use std::convert::TryFrom;
+
 // ============================================================================
 // PRE-COMPUTED EIP712 CONSTANTS
 // ============================================================================
@@ -258,27 +269,55 @@ pub fn size_to_micro(size: f64) -> u64 {
     ((size * 1_000_000.0).floor() as i64).max(0) as u64
 }
 
+/// Truncate amount to specific decimal places (assuming 6 base decimals)
+/// e.g. 2 decimals -> round down to nearest 10000 (0.01)
+/// 4 decimals -> round down to nearest 100 (0.0001)
+#[inline(always)]
+fn truncate_to_decimals(amount: u128, decimals: u32) -> u128 {
+    let step = 10_u128.pow(6 - decimals);
+    (amount / step) * step
+}
+
 /// BUY order calculation
 /// Input: size in micro-units, price in basis points
 /// Output: (side=0, maker_amount, taker_amount) in token decimals (6 dp)
+/// ENFORCES: Maker (USDC) max 2 decimals, Taker (Shares) max 4 decimals
 #[inline(always)]
 pub fn get_order_amounts_buy(size_micro: u64, price_bps: u64) -> (i32, u128, u128) {
     // For BUY: taker = size (what we receive), maker = size * price (what we pay)
-    let taker = size_micro as u128;
-    // maker = size * price / 10000 (convert bps to ratio)
-    let maker = (size_micro as u128 * price_bps as u128) / 10000;
+
+    // Taker (Shares): Truncate to 4 decimals
+    let taker_raw = size_micro as u128; // Taker is Size
+    let taker = truncate_to_decimals(taker_raw, 4);
+
+    // Maker (USDC): Calculate based on TRUNCATED Taker amount to ensure consistency?
+    // Or just truncate final maker?
+    // Usually: Maker = Taker * Price.
+    let maker_raw = (taker * price_bps as u128) / 10000;
+    let maker = truncate_to_decimals(maker_raw, 2);
+
+    // Re-verify relationship?
+    // If we truncate Maker, effective price might change slightly.
+    // But CLOB demands this precision.
     (0, maker, taker)
 }
 
 /// SELL order calculation
 /// Input: size in micro-units, price in basis points
 /// Output: (side=1, maker_amount, taker_amount) in token decimals (6 dp)
+/// ENFORCES: Maker (Shares) max 4 decimals, Taker (USDC) max 2 decimals
 #[inline(always)]
 pub fn get_order_amounts_sell(size_micro: u64, price_bps: u64) -> (i32, u128, u128) {
     // For SELL: maker = size (what we give), taker = size * price (what we receive)
-    let maker = size_micro as u128;
-    // taker = size * price / 10000 (convert bps to ratio)
-    let taker = (size_micro as u128 * price_bps as u128) / 10000;
+
+    // Maker (Shares): Truncate to 4 decimals
+    let maker_raw = size_micro as u128;
+    let maker = truncate_to_decimals(maker_raw, 4);
+
+    // Taker (USDC): Calculate based on TRUNCATED Maker amount
+    let taker_raw = (maker * price_bps as u128) / 10000;
+    let taker = truncate_to_decimals(taker_raw, 2);
+
     (1, maker, taker)
 }
 
@@ -408,6 +447,7 @@ pub struct PolymarketOrderResponse {
 /// Async Polymarket client for execution
 pub struct PolymarketAsyncClient {
     host: String,
+    rpc_url: String,
     chain_id: u64,
     http: reqwest::Client, // Async client with connection pooling
     wallet: Arc<LocalWallet>,
@@ -417,7 +457,13 @@ pub struct PolymarketAsyncClient {
 }
 
 impl PolymarketAsyncClient {
-    pub fn new(host: &str, chain_id: u64, private_key: &str, funder: &str) -> Result<Self> {
+    pub fn new(
+        host: &str,
+        rpc_url: &str,
+        chain_id: u64,
+        private_key: &str,
+        funder: &str,
+    ) -> Result<Self> {
         let wallet = private_key.parse::<LocalWallet>()?.with_chain_id(chain_id);
         let wallet_address_str = format!("{:?}", wallet.address());
         let address_header = HeaderValue::from_str(&wallet_address_str)
@@ -434,6 +480,7 @@ impl PolymarketAsyncClient {
 
         Ok(Self {
             host: host.trim_end_matches('/').to_string(),
+            rpc_url: rpc_url.to_string(),
             chain_id,
             http,
             wallet: Arc::new(wallet),
@@ -608,19 +655,31 @@ impl SharedAsyncClient {
     }
 
     /// Execute FAK buy order -
-    pub async fn buy_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
+    pub async fn buy_fak(
+        &self,
+        token_id: &str,
+        price: f64,
+        size: f64,
+        fee: bool,
+    ) -> Result<PolyFillAsync> {
         debug_assert!(!token_id.is_empty(), "token_id must not be empty");
         debug_assert!(price > 0.0 && price < 1.0, "price must be 0 < p < 1");
         debug_assert!(size >= 1.0, "size must be >= 1");
-        self.execute_order(token_id, price, size, "BUY").await
+        self.execute_order(token_id, price, size, "BUY", fee).await
     }
 
     /// Execute FAK sell order -
-    pub async fn sell_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
+    pub async fn sell_fak(
+        &self,
+        token_id: &str,
+        price: f64,
+        size: f64,
+        fee: bool,
+    ) -> Result<PolyFillAsync> {
         debug_assert!(!token_id.is_empty(), "token_id must not be empty");
         debug_assert!(price > 0.0 && price < 1.0, "price must be 0 < p < 1");
         debug_assert!(size >= 1.0, "size must be >= 1");
-        self.execute_order(token_id, price, size, "SELL").await
+        self.execute_order(token_id, price, size, "SELL", fee).await
     }
 
     async fn execute_order(
@@ -629,6 +688,7 @@ impl SharedAsyncClient {
         price: f64,
         size: f64,
         side: &str,
+        fee: bool,
     ) -> Result<PolyFillAsync> {
         // Check neg_risk cache first
         let neg_risk = {
@@ -647,7 +707,7 @@ impl SharedAsyncClient {
         };
 
         // Build signed order
-        let signed = self.build_signed_order(token_id, price, size, side, neg_risk)?;
+        let signed = self.build_signed_order(token_id, price, size, side, neg_risk, fee)?;
         // Owner must be the API key (not wallet address or funder!)
         let body = signed.post_body(&self.creds.api_key, PolyOrderType::FAK.as_str());
 
@@ -696,6 +756,7 @@ impl SharedAsyncClient {
         size: f64,
         side: &str,
         neg_risk: bool,
+        fee: bool,
     ) -> Result<SignedOrder> {
         let price_bps = price_to_bps(price);
         let size_micro = size_to_micro(size);
@@ -720,6 +781,8 @@ impl SharedAsyncClient {
         let maker_amount_str = maker_amt.to_string();
         let taker_amount_str = taker_amt.to_string();
 
+        let fee_rate_bps = if fee { "1000" } else { "0" };
+
         // Use references for EIP712 signing
         let data = OrderData {
             maker: &self.inner.funder,
@@ -728,7 +791,7 @@ impl SharedAsyncClient {
             maker_amount: &maker_amount_str,
             taker_amount: &taker_amount_str,
             side: side_code,
-            fee_rate_bps: "1000",
+            fee_rate_bps,
             nonce: "0",
             signer: &self.inner.wallet_address_str,
             expiration: "0",
@@ -753,12 +816,172 @@ impl SharedAsyncClient {
                 taker_amount: taker_amount_str,
                 expiration: "0".to_string(),
                 nonce: "0".to_string(),
-                fee_rate_bps: "1000".to_string(),
+                fee_rate_bps: fee_rate_bps.to_string(),
                 side: side_code,
                 signature_type: 0,
             },
             signature: format!("0x{}", sig),
         })
+    }
+    /// Redeem winning positions from CTF Exchange
+    /// Uses stored RPC URL
+    pub async fn redeem_positions(
+        &self,
+        condition_id: &str,
+        index_sets: Vec<U256>,
+    ) -> Result<H256> {
+        // 1. Setup Provider
+        let provider = Provider::<Http>::try_from(&self.inner.rpc_url)?;
+        let provider = Arc::new(provider);
+
+        // 2. Setup Signer (Wallet)
+        // Use wallet() getter to clone from Arc
+        let wallet = self.inner.wallet().clone().with_chain_id(self.chain_id);
+        let client = SignerMiddleware::new(Arc::clone(&provider), wallet);
+        let client = Arc::new(client);
+
+        // 3. Prepare Contract Arguments
+        // function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint[] indexSets)
+
+        let ctf_addr: Address = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045".parse()?;
+        let collateral: Address = USDC_E_ADDR.parse()?;
+
+        // condition_id is hex string
+        let condition_id_bytes = ethers::utils::hex::decode(condition_id.trim_start_matches("0x"))?;
+
+        if condition_id_bytes.len() != 32 {
+            return Err(anyhow!("Invalid condition_id length"));
+        }
+        let condition_id_token = Token::FixedBytes(condition_id_bytes);
+
+        let parent_collection_id = Token::FixedBytes(vec![0u8; 32]);
+
+        // indexSets provided by caller
+        let index_sets_tokens: Vec<Token> = index_sets.into_iter().map(Token::Uint).collect();
+        let index_sets_array = Token::Array(index_sets_tokens);
+
+        // 4. Encode Function Data
+        // Selector for redeemPositions(address,bytes32,bytes32,uint256[]) = 0x8f757270
+        let func_sig = "redeemPositions(address,bytes32,bytes32,uint256[])";
+        let selector = ethers::utils::id(func_sig);
+        let mut data = selector[0..4].to_vec();
+
+        let args = encode(&[
+            Token::Address(collateral),
+            parent_collection_id,
+            condition_id_token,
+            index_sets_array,
+        ]);
+        data.extend(args);
+
+        // 5. Build TransactionRequest then convert to TypedTransaction to set EIP-1559 fields
+        let tx_req = TransactionRequest::new()
+            .to(ctf_addr)
+            .data(data.clone())
+            .value(U256::zero());
+
+        let typed: TypedTransaction = tx_req.into();
+
+        // Send and return hash (don't wait for confirmation here to keep it async/fast)
+        let pending_tx = client.send_transaction(typed, None).await?;
+        let tx_hash = pending_tx.tx_hash();
+
+        tracing::info!("[Redeem] Transaction sent: {:?}", tx_hash);
+
+        Ok(tx_hash)
+    }
+
+    /// Fetch all positions for the current wallet from Data API
+    /// Returns a Map of Condition IDs to their redeemable IndexSets (Outcome Masks).
+    pub async fn get_redeemable_conditions(&self) -> Result<HashMap<String, Vec<U256>>> {
+        let wallet = self.inner.wallet_address_str.clone();
+        // https://data-api.polymarket.com/positions?user=0x...
+        let wallet_clean = wallet.trim_matches('"');
+        let url = format!(
+            "https://data-api.polymarket.com/positions?user={}",
+            wallet_clean
+        );
+
+        let resp = self.inner.http.get(&url).send().await?;
+
+        if !resp.status().is_success() {
+            return Err(anyhow!("Failed to fetch positions: {}", resp.status()));
+        }
+
+        let value: serde_json::Value = resp.json().await?;
+        // API returns a list of positions directly or nested?
+        // Usually list of objects.
+        let positions = value
+            .as_array()
+            .ok_or_else(|| anyhow!("Invalid positions response format"))?;
+
+        let mut redeemable_map: HashMap<String, Vec<U256>> = HashMap::new();
+
+        for pos in positions {
+            // Check if size > 0
+            if let Some(redeemable) = pos.get("redeemable").and_then(|v| v.as_bool()) {
+                if redeemable {
+                    if let Some(condition_id) = pos.get("conditionId").and_then(|v| v.as_str()) {
+                        // Get outcomeIndex to determine indexSet
+                        // outcomeIndex 0 -> 1 (1 << 0)
+                        // outcomeIndex 1 -> 2 (1 << 1)
+                        if let Some(outcome_index) =
+                            pos.get("outcomeIndex").and_then(|v| v.as_u64())
+                        {
+                            let index_set = U256::from(1) << outcome_index;
+
+                            redeemable_map
+                                .entry(condition_id.to_string())
+                                .or_default()
+                                .push(index_set);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Dedup index sets per condition just in case
+        for sets in redeemable_map.values_mut() {
+            sets.sort();
+            sets.dedup();
+        }
+
+        Ok(redeemable_map)
+    }
+
+    /// Auto-Redeem all held positions
+    /// Iterates through all redeemable positions and attempts to redeem them.
+    pub async fn auto_redeem_positions(&self) -> Result<()> {
+        let conditions_map = self.get_redeemable_conditions().await?;
+        tracing::info!(
+            "[AutoRedeem] Found {} redeemable conditions. Attempting to redeem...",
+            conditions_map.len()
+        );
+
+        for (condition_id, index_sets) in conditions_map {
+            tracing::info!(
+                "[AutoRedeem] Redeeming condition {} with indexSets {:?}",
+                condition_id,
+                index_sets
+            );
+            match self.redeem_positions(&condition_id, index_sets).await {
+                Ok(tx) => {
+                    tracing::info!(
+                        "[AutoRedeem] Redeemed condition {}: Tx {}",
+                        condition_id,
+                        tx
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[AutoRedeem] Failed to redeem condition {}: {}",
+                        condition_id,
+                        e
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -768,4 +991,57 @@ pub struct PolyFillAsync {
     pub order_id: String,
     pub filled_size: f64,
     pub fill_cost: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+    use tracing::Level;
+
+    #[tokio::test]
+    async fn test_auto_redeem_positions() -> Result<()> {
+        // Initialize logging
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env().add_directive(Level::INFO.into()),
+            )
+            .init();
+
+        dotenvy::dotenv().ok();
+
+        // Setup credentials from env
+        let private_key = std::env::var("POLY_PRIVATE_KEY").context("POLY_PRIVATE_KEY not set")?;
+        let funder = std::env::var("POLY_FUNDER").context("POLY_FUNDER not set")?;
+        let ws_url = std::env::var("POLYGON_WS_URL").unwrap_or_default();
+        let rpc_url = std::env::var("POLYGON_RPC_URL").unwrap_or(ws_url);
+
+        if rpc_url.is_empty() {
+            panic!("Neither POLYGON_RPC_URL nor POLYGON_WS_URL set");
+        }
+
+        println!("Initializing client with RPC/WS: {}", rpc_url);
+
+        let poly_client = PolymarketAsyncClient::new(
+            "https://clob.polymarket.com",
+            &rpc_url,
+            137, // Polygon Mainnet
+            &private_key,
+            &funder,
+        )?;
+
+        // Derive API Key
+        let api_creds = poly_client.derive_api_key(0).await?;
+        let prepared_creds = PreparedCreds::from_api_creds(&api_creds)?;
+
+        // Create Shared Client
+        let shared_client = SharedAsyncClient::new(poly_client, prepared_creds, 137);
+
+        println!("Starting auto-redeem...");
+        // Run auto_redeem
+        shared_client.auto_redeem_positions().await?;
+        println!("Auto-redeem completed.");
+
+        Ok(())
+    }
 }

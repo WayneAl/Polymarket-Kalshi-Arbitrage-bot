@@ -329,7 +329,11 @@ impl Strategy0x8dxd {
 
                 let size = MAX_POSITION_USD / current_price;
 
-                match self.client.buy_fak(token_id, current_price, size).await {
+                match self
+                    .client
+                    .buy_fak(token_id, current_price, size, true)
+                    .await
+                {
                     Ok(fill) => info!("[0x8dxd] Executed! Matched: {}", fill.filled_size),
                     Err(e) => error!("[0x8dxd] Execution Failed: {}", e),
                 }

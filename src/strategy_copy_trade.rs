@@ -156,14 +156,17 @@ impl StrategyCopyTrade {
                 if !dry_run {
                     warn!("[CopyTrade] Executing BUY for {}...", token_to_trade);
                     // Match the size or use a config size?
-                    let _ = self.client.buy_fak(&token_to_trade, 0.99, trade.size).await;
+                    let _ = self
+                        .client
+                        .buy_fak(&token_to_trade, 0.99, trade.size, true)
+                        .await;
                 }
             } else if trade.side == "SELL" {
                 if !dry_run {
                     warn!("[CopyTrade] Executing SELL for {}...", token_to_trade);
                     let _ = self
                         .client
-                        .sell_fak(&token_to_trade, 0.01, trade.size)
+                        .sell_fak(&token_to_trade, 0.01, trade.size, true)
                         .await;
                 }
             }
@@ -225,6 +228,7 @@ mod tests {
         // Construct Dummy Client (won't actually be used for fetch_activity HTTP calls)
         let poly_client = PolymarketAsyncClient::new(
             "https://clob.polymarket.com",
+            "http://localhost:8545",
             137,
             &private_key,
             "0x0000000000000000000000000000000000000000",
@@ -294,6 +298,7 @@ mod tests {
 
         let poly_client = PolymarketAsyncClient::new(
             "https://clob.polymarket.com",
+            "http://localhost:8545",
             137,
             &private_key,
             "0x0000000000000000000000000000000000000000",
@@ -372,12 +377,15 @@ mod tests {
         let poly_private_key =
             std::env::var("POLY_PRIVATE_KEY").context("POLY_PRIVATE_KEY not set")?;
         let poly_funder = std::env::var("POLY_FUNDER").context("POLY_FUNDER not set")?;
+        let ws_url = std::env::var("POLYGON_WS_URL").context("POLYGON_WS_URL not set")?;
+        let rpc_url = std::env::var("POLYGON_RPC_URL").unwrap_or_else(|_| ws_url.clone());
 
         // Create Client
         info!("Creating Polymarket Client...");
         // 137 for Polygon
         let poly_client = PolymarketAsyncClient::new(
             "https://clob.polymarket.com",
+            &rpc_url,
             137,
             &poly_private_key,
             &poly_funder,
@@ -408,7 +416,7 @@ mod tests {
         );
 
         // Execute BUY FAK
-        match shared_client.buy_fak(token_id, price, size).await {
+        match shared_client.buy_fak(token_id, price, size, true).await {
             Ok(fill) => {
                 println!("✅ Order Successful!");
                 println!("Order ID: {}", fill.order_id);

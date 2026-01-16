@@ -45,8 +45,12 @@ async fn main() -> Result<()> {
     // Create Client
     info!("Creating Polymarket Client...");
     // 137 for Polygon
+    let ws_url_env = std::env::var("POLYGON_WS_URL").unwrap_or_default();
+    let rpc_url = std::env::var("POLYGON_RPC_URL").unwrap_or(ws_url_env);
+
     let poly_client = PolymarketAsyncClient::new(
         "https://clob.polymarket.com",
+        &rpc_url,
         137,
         &poly_private_key,
         &poly_funder,
