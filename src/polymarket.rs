@@ -43,8 +43,12 @@ pub struct PriceChangeEvent {
 #[derive(Deserialize, Debug)]
 pub struct PriceChangeItem {
     pub asset_id: String,
-    pub price: Option<String>,
-    pub side: Option<String>,
+    pub price: String,
+    pub side: String,
+    pub hash: String,
+    pub size: String,
+    pub best_bid: String,
+    pub best_ask: String,
 }
 
 #[derive(Serialize)]
@@ -126,7 +130,7 @@ impl GammaClient {
     }
     pub async fn fetch_markets(&self, tag: &str) -> Result<Vec<GammaMarket>> {
         let url = format!(
-            "{}/events?tag_slug={}&order=endDate&ascending=true&closed=false&limit=4",
+            "{}/events?tag_slug={}&order=endDate&ascending=true&closed=false&limit=8",
             GAMMA_API_BASE, tag
         );
         info!("[GAMMA] Fetching markets for tag: {}", tag);
@@ -149,6 +153,7 @@ impl GammaClient {
     /// Discover specifically "15M" markets and parse them into MarketPair objects
     pub async fn discover_15m_markets(&self) -> Result<Vec<MarketPair>> {
         let markets = self.fetch_markets("15M").await?;
+        let ts_now = Utc::now().timestamp();
 
         let mut pairs = Vec::new();
         for market in markets {
@@ -224,7 +229,7 @@ impl GammaClient {
                                 Err(e) => warn!("[GAMMA] Failed to fetch price: {}", e),
                             }
                         }
-                        if strike_price.is_some() {
+                        if strike_price.is_some() && ts_now < expiry_timestamp.unwrap() {
                             // Synthesize a MarketPair
                             let pair = MarketPair {
                                 pair_id: Arc::from(format!("poly-{}", slug)),
@@ -403,15 +408,18 @@ pub async fn run_ws(state: Arc<tokio::sync::RwLock<GlobalState>>) -> Result<()> 
 
                         // Try book snapshot first
                         if let Ok(books) = serde_json::from_str::<Vec<BookSnapshot>>(&text) {
+                            println!("Received {} book snapshots", books.len());
                             for book in &books {
                                 process_book(&state, book).await;
                             }
                         }
                         // Try price change event
                         else if let Ok(event) = serde_json::from_str::<PriceChangeEvent>(&text) {
+                            // println!("Received {:?}", event);
                             if event.event_type.as_deref() == Some("price_change") {
                                 if let Some(changes) = &event.price_changes {
                                     for change in changes {
+                                        // println!("change {:?}", change);
                                         process_price_change(&state, change).await;
                                     }
                                 }
@@ -497,18 +505,8 @@ async fn process_price_change(
     state: &Arc<tokio::sync::RwLock<GlobalState>>,
     change: &PriceChangeItem,
 ) {
-    // Only process ASK side updates
-    if !matches!(change.side.as_deref(), Some("ASK" | "ask")) {
-        return;
-    }
-
-    let Some(price_str) = &change.price else {
-        return;
-    };
-    let price = parse_price(price_str);
-    if price == 0 {
-        return;
-    }
+    let price = parse_price(&change.best_ask);
+    // println!("Processing price change for {}: {}", change.asset_id, price);
 
     let token_hash = fxhash_str(&change.asset_id);
 
@@ -518,22 +516,11 @@ async fn process_price_change(
     // Check YES token
     if let Some(&market_id) = s.poly_yes_to_id.get(&token_hash) {
         let market = &s.markets[market_id as usize];
-        let (current_yes, _, current_yes_size, _) = market.poly.load();
-
-        // Only update if new price is better (lower)
-        if price < current_yes || current_yes == 0 {
-            // Keep existing size - it may be stale but FAK orders handle partial fills.
-            // Size is an upper bound anyway; better to attempt arb than miss it.
-            market.poly.update_yes(price, current_yes_size);
-        }
+        market.poly.update_yes(price, parse_price("0"));
     }
     // Check NO token
     else if let Some(&market_id) = s.poly_no_to_id.get(&token_hash) {
         let market = &s.markets[market_id as usize];
-        let (_, current_no, _, current_no_size) = market.poly.load();
-
-        if price < current_no || current_no == 0 {
-            market.poly.update_no(price, current_no_size);
-        }
+        market.poly.update_no(price, parse_price("0"));
     }
 }
