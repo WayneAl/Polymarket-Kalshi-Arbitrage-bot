@@ -194,6 +194,7 @@ pub struct Config {
 #[serde(rename_all = "snake_case")]
 pub enum StrategyType {
     Strategy0x8dxd,
+    StrategyGabagool,
     CopyTrade,
 }
 

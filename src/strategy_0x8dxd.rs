@@ -173,7 +173,7 @@ impl Strategy0x8dxd {
         let now_ts = Utc::now().timestamp();
         let time_remaining_secs = self.expiry_ts - now_ts;
 
-        if time_remaining_secs <= 0 {
+        if time_remaining_secs <= 60 {
             return Ok(true);
         }
 
@@ -212,7 +212,6 @@ impl Strategy0x8dxd {
         // );
 
         let fair_prob_no = 1.0 - fair_prob_yes;
-        let mut opps = Vec::new();
 
         let (poly_yes_token, poly_no_token, yes_ask, no_ask) = {
             let s = self.state.read().await;
@@ -224,53 +223,58 @@ impl Strategy0x8dxd {
 
         // info!("YES ASK: {} NO ASK: {}", yes_ask, no_ask);
 
-        if yes_ask > 0 {
-            let market_price_yes = yes_ask as f64 / 100.0;
-            if let Some(msg) = self
-                .check_and_execute(
-                    "BUY",
-                    market_price_yes,
-                    fair_prob_yes,
-                    dry_run,
-                    &poly_yes_token,
-                    &poly_no_token,
-                )
-                .await?
-            {
-                opps.push(msg);
-            }
+        if yes_ask + no_ask < 100 {
+            info!("YES ASK: {} NO ASK: {}", yes_ask, no_ask);
         }
 
-        if no_ask > 0 {
-            let market_price_no = no_ask as f64 / 100.0;
-            if let Some(msg) = self
-                .check_and_execute(
-                    "SELL",
-                    market_price_no,
-                    fair_prob_no,
-                    dry_run,
-                    &poly_yes_token,
-                    &poly_no_token,
-                )
-                .await?
-            {
-                opps.push(msg);
-            }
-        }
+        // let mut opps = Vec::new();
+        // if yes_ask > 0 {
+        //     let market_price_yes = yes_ask as f64 / 100.0;
+        //     if let Some(msg) = self
+        //         .check_and_execute(
+        //             "BUY",
+        //             market_price_yes,
+        //             fair_prob_yes,
+        //             dry_run,
+        //             &poly_yes_token,
+        //             &poly_no_token,
+        //         )
+        //         .await?
+        //     {
+        //         opps.push(msg);
+        //     }
+        // }
 
-        if !opps.is_empty() {
-            // Access pair_id for logging
-            let pair_id = {
-                let s = self.state.read().await;
-                let m = s.get_by_id(self.market_id).unwrap();
-                m.pair
-                    .as_ref()
-                    .map(|p| p.pair_id.to_string())
-                    .unwrap_or_default()
-            };
-            let action_status = opps.join(" | ");
-            info!("[{}] {}", pair_id, action_status);
-        }
+        // if no_ask > 0 {
+        //     let market_price_no = no_ask as f64 / 100.0;
+        //     if let Some(msg) = self
+        //         .check_and_execute(
+        //             "SELL",
+        //             market_price_no,
+        //             fair_prob_no,
+        //             dry_run,
+        //             &poly_yes_token,
+        //             &poly_no_token,
+        //         )
+        //         .await?
+        //     {
+        //         opps.push(msg);
+        //     }
+        // }
+
+        // if !opps.is_empty() {
+        //     // Access pair_id for logging
+        //     let pair_id = {
+        //         let s = self.state.read().await;
+        //         let m = s.get_by_id(self.market_id).unwrap();
+        //         m.pair
+        //             .as_ref()
+        //             .map(|p| p.pair_id.to_string())
+        //             .unwrap_or_default()
+        //     };
+        //     let action_status = opps.join(" | ");
+        //     info!("[{}] {}", pair_id, action_status);
+        // }
 
         Ok(false)
     }

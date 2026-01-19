@@ -29,6 +29,7 @@ mod polymarket_clob;
 mod strategy_0x8dxd;
 mod strategy_copy_trade;
 mod strategy_copy_trade_ws;
+mod strategy_gabagool;
 mod types;
 
 use anyhow::{Context, Result};
@@ -242,6 +243,27 @@ async fn main() -> Result<()> {
                                 market_id,
                                 target,
                                 poly_async.clone(),
+                            )
+                            .await;
+                            tokio::spawn(strat.run(dry_run))
+                        }
+                        crate::config::StrategyType::StrategyGabagool => {
+                            // Read configurable parameters from env
+                            let buy_step = std::env::var("GABAGOOL_BUY_STEP")
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(50.0);
+
+                            let pair_cost_threshold = std::env::var("GABAGOOL_PAIR_COST_THRESHOLD")
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.99);
+
+                            let strat = crate::strategy_gabagool::StrategyGabagool::new(
+                                state.clone(),
+                                poly_async.clone(),
+                                buy_step,
+                                pair_cost_threshold,
                             )
                             .await;
                             tokio::spawn(strat.run(dry_run))
