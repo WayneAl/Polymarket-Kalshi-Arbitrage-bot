@@ -89,6 +89,23 @@ async fn main() -> Result<()> {
         dry_run, target_address
     );
 
+    // Spawn background task to auto-redeem positions every 10 minutes
+    {
+        let client = poly_async.clone();
+        tokio::spawn(async move {
+            loop {
+                tracing::info!("[AutoRedeemTask] Running auto_redeem_positions...");
+                match client.auto_redeem_positions().await {
+                    Ok(_) => tracing::info!("[AutoRedeemTask] auto_redeem_positions completed"),
+                    Err(e) => {
+                        tracing::error!("[AutoRedeemTask] auto_redeem_positions failed: {:?}", e)
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(600)).await; // 10 minutes
+            }
+        });
+    }
+
     strategy.run(dry_run).await;
 
     Ok(())
