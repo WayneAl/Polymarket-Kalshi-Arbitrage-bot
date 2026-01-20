@@ -182,7 +182,7 @@ pub struct AssetConfig {
     pub default_sigma: f64,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct Config {
     pub polygon_ws_url: Option<String>,
     pub active_strategy: Option<StrategyType>,

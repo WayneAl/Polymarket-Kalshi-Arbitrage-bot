@@ -1,40 +1,65 @@
 [package]
 name = "prediction-market-arbitrage"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 description = "Kalshi-Poly / Poly-Poly / Kalshi-Kalshi arbitrage bot - automated cross-platform prediction market trading system"
-keywords = ["polymarket", "kalshi", "arbitrage", "trading-bot", "prediction-markets", "kalshi-poly", "poly-poly", "kalshi-kalshi", "polymarket-arbitrage", "kalshi-arbitrage", "cross-platform-trading"]
+keywords = ["polymarket", "kalshi", "arbitrage", "trading-bot", "prediction-markets"]
 authors = ["teraus"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/terauss/prediction-market-arbitrage"
+default-run = "bot"
+
+[lib]
+name = "prediction_market_arbitrage"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bot"
+path = "src/bin/bot.rs"
+
+[[bin]]
+name = "orderbook"
+path = "src/bin/orderbook.rs"
+
+[[bin]]
+name = "tracker"
+path = "src/bin/tracker.rs"
 
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
 chrono = "0.4"
 dotenvy = "0.15"
-ethers = { version = "2.0", features = ["legacy", "ws"] }
 futures-util = "0.3"
-hmac = "0.12"
 rand = "0.8"
 reqwest = { version = "0.11", features = ["json", "blocking"] }
 
+# Serialization
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
-sha2 = "0.10"
-regex = "1"
+
+# Async & Runtime
 tokio = { version = "1.0", features = ["full"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+
+# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+clap = { version = "4.4", features = ["derive"] }
 rustc-hash = "2.0"
-tiny-keccak = { version = "2.0", features = ["keccak"] }
 governor = "0.6"
 nonzero_ext = "0.3"
 arrayvec = "0.7"
-
 statrs = "0.16"
 crossterm = "0.27"
+regex = "1"
+rust_decimal = "1.33"
+
+# Web3 & Polymarket
+alloy = { version = "1.4.3", features = ["full", "node-bindings", "rpc-types-eth", "signer-local", "signer-aws"] }
+polymarket-client-sdk = { git = "https://github.com/Polymarket/rs-clob-client", features = ["clob", "ws", "gamma"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

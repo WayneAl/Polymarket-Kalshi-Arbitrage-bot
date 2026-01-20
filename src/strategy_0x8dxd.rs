@@ -11,7 +11,7 @@ use tracing::{error, info, warn};
 
 use crate::binance_ws::{BinanceClient, BinancePrice};
 
-use crate::polymarket_clob::SharedAsyncClient;
+use crate::polymarket::Client;
 use crate::types::GlobalState;
 
 // Configurable parameters
@@ -31,7 +31,7 @@ pub struct Strategy0x8dxd {
     state: Arc<tokio::sync::RwLock<GlobalState>>,
     market_id: u16,
     asset: String, // e.g., "BTC", "ETH"
-    client: Arc<SharedAsyncClient>,
+    client: Client,
     price_rx: broadcast::Receiver<BinancePrice>,
     binance_client: BinanceClient,
     pricing_model: PricingModel,
@@ -49,7 +49,7 @@ impl Strategy0x8dxd {
         market_id: u16,
         asset: String,
         default_sigma: f64,
-        client: Arc<SharedAsyncClient>,
+        client: Client,
         binance_client: BinanceClient,
     ) -> Self {
         // Select model from environment or default to Black-Scholes

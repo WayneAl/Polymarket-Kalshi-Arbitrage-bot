@@ -1,4 +1,4 @@
-use crate::polymarket_clob::SharedAsyncClient;
+use crate::polymarket::Client;
 use crate::types::{cents_to_price, GlobalState, MarketPair};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -8,8 +8,8 @@ use tracing::info;
 /// Gabagool-like pair hedging strategy
 pub struct StrategyGabagool {
     state: Arc<RwLock<GlobalState>>,
-    client: Arc<SharedAsyncClient>,
-    // per-market running totals: market_id -> (qty_yes, cost_yes, qty_no, cost_no)
+    client: Client,
+    // per-market run totals: market_id -> (qty_yes, cost_yes, qty_no, cost_no)
     totals: HashMap<u16, (f64, f64, f64, f64)>,
     pair_cost_threshold: f64,
     buy_step: f64,
@@ -18,7 +18,7 @@ pub struct StrategyGabagool {
 impl StrategyGabagool {
     pub async fn new(
         state: Arc<RwLock<GlobalState>>,
-        client: Arc<SharedAsyncClient>,
+        client: Client,
         buy_step: f64,
         pair_cost_threshold: f64,
     ) -> Self {

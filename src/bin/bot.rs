@@ -3,42 +3,18 @@
 //! A high-performance, production-ready arbitrage trading system for cross-platform
 //! prediction markets. This system monitors price discrepancies between Kalshi and
 //! Polymarket, executing risk-free arbitrage opportunities in real-time.
-//!
-//! ## Strategy
-//!
-//! The core arbitrage strategy exploits the fundamental property of prediction markets:
-//! YES + NO = $1.00 (guaranteed). Arbitrage opportunities exist when:
-//!
-//! ```
-//! Best YES ask (Platform A) + Best NO ask (Platform B) < $1.00
-//! ```
-//!
-//! ## Architecture
-//!
-//! - **Real-time price monitoring** via WebSocket connections to both platforms
-//! - **Lock-free orderbook cache** using atomic operations for zero-copy updates
-//! - **SIMD-accelerated arbitrage detection** for sub-millisecond latency
-//! - **Concurrent order execution** with automatic position reconciliation
-//! - **Circuit breaker protection** with configurable risk limits
-//! - **Market discovery system** with intelligent caching and incremental updates
-
-mod binance_ws;
-mod config;
-mod polymarket;
-mod polymarket_clob;
-mod strategy_0x8dxd;
-mod strategy_copy_trade;
-mod strategy_copy_trade_ws;
-mod strategy_gabagool;
-mod types;
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
-
 use tracing::{error, info, warn, Level};
 
-use polymarket_clob::{PolymarketAsyncClient, PreparedCreds, SharedAsyncClient};
-use types::GlobalState;
+// Import from the library crate
+use prediction_market_arbitrage::{
+    binance_ws, config, polymarket, strategy_0x8dxd, strategy_copy_trade, strategy_gabagool,
+    types::{GlobalState, MarketPair, MarketType},
+};
+
+use polymarket::Client;
 
 /// Polymarket CLOB API host
 const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
@@ -63,7 +39,7 @@ async fn main() -> Result<()> {
         .with_timer(SimpleTime)
         .init();
 
-    info!("🚀 Prediction Market Arbitrage System v2.0");
+    info!("🚀 Prediction Market Arbitrage System v2.1 (Alloy/CLOB-Client)");
 
     // Check for dry run mode
     let dry_run = std::env::var("DRY_RUN")
@@ -77,7 +53,7 @@ async fn main() -> Result<()> {
 
     // Load configuration
     info!("[CONFIG] Loading config.json...");
-    let config = crate::config::load_config("config.json").context("Failed to load config.json")?;
+    let config = config::load_config("config.json").context("Failed to load config.json")?;
     info!("[CONFIG] Loaded {} assets", config.assets.len());
 
     // Load Polymarket credentials
@@ -85,27 +61,16 @@ async fn main() -> Result<()> {
     let poly_private_key = std::env::var("POLY_PRIVATE_KEY").context("POLY_PRIVATE_KEY not set")?;
     let poly_funder =
         std::env::var("POLY_FUNDER").context("POLY_FUNDER not set (your wallet address)")?;
-    // Fallback or require RPC URL
-    let rpc_url = std::env::var("POLYGON_RPC_URL")
-        .or_else(|_| std::env::var("POLYGON_WS_URL"))
-        .context("POLYGON_RPC_URL or POLYGON_WS_URL not set")?;
 
-    // Create async Polymarket client
-    info!("[POLYMARKET] Creating async client and deriving API credentials...");
-    let poly_async_client = PolymarketAsyncClient::new(
+    // Create new Client (official-based)
+    info!("[POLYMARKET] Initializing official CLOB client...");
+    let poly_client = Client::new(
         POLY_CLOB_HOST,
-        &rpc_url,
         POLYGON_CHAIN_ID,
         &poly_private_key,
         &poly_funder,
-    )?;
-    let api_creds = poly_async_client.derive_api_key(0).await?;
-    let prepared_creds = PreparedCreds::from_api_creds(&api_creds)?;
-    let poly_async = Arc::new(SharedAsyncClient::new(
-        poly_async_client,
-        prepared_creds,
-        POLYGON_CHAIN_ID,
-    ));
+    )
+    .await?;
 
     info!("[POLYMARKET] Client ready for {}", &poly_funder[..10]);
 
@@ -115,17 +80,17 @@ async fn main() -> Result<()> {
     let state = Arc::new(tokio::sync::RwLock::new(GlobalState::new()));
 
     // 2. Initialize Binance Price Feed (One for all strategies)
-    // 2. Initialize Binance Price Feed (One loop, shared history)
     let symbols: Vec<String> = config.assets.iter().map(|a| a.symbol.clone()).collect();
     info!("🚀 Connecting to Binance Stream for {:?}...", symbols);
     let (binance_client, binance_driver) =
-        crate::binance_ws::BinanceClient::new(crate::binance_ws::BINANCE_WS_URL.to_string());
+        binance_ws::BinanceClient::new(binance_ws::BINANCE_WS_URL.to_string());
 
     // Spawn Binance (forever)
     tokio::spawn(binance_driver.run());
 
     // 4. Discovery Setup
-    let gamma_client = crate::polymarket::GammaClient::new();
+    // Use the gamma client from the wrapper
+    let gamma_client = poly_client.gamma.clone();
 
     // Trackers
     let mut poly_ws_handle: Option<tokio::task::JoinHandle<()>> = None;
@@ -139,6 +104,7 @@ async fn main() -> Result<()> {
 
             // A. Discovery
             match gamma_client.discover_15m_markets().await {
+                // Trackers
                 Ok(pairs) => {
                     info!("🔎 Discovered {} potential markets", pairs.len());
                     // Add new pairs to global state
@@ -219,12 +185,12 @@ async fn main() -> Result<()> {
 
                     let handle = match strategy_type {
                         crate::config::StrategyType::Strategy0x8dxd => {
-                            let strat = crate::strategy_0x8dxd::Strategy0x8dxd::new(
+                            let strat = strategy_0x8dxd::Strategy0x8dxd::new(
                                 state.clone(),
                                 market_id,
                                 asset_cfg.symbol.clone(),
                                 asset_cfg.default_sigma,
-                                poly_async.clone(),
+                                poly_client.clone(),
                                 binance_client.clone(),
                             )
                             .await;
@@ -238,11 +204,11 @@ async fn main() -> Result<()> {
                                 .expect("CopyTrade active but config missing");
 
                             // Refactored to use API polling
-                            let strat = crate::strategy_copy_trade::StrategyCopyTrade::new(
+                            let strat = strategy_copy_trade::StrategyCopyTrade::new(
                                 state.clone(),
                                 market_id,
                                 target,
-                                poly_async.clone(),
+                                poly_client.clone(),
                             )
                             .await;
                             tokio::spawn(strat.run(dry_run))
@@ -259,9 +225,9 @@ async fn main() -> Result<()> {
                                 .and_then(|s| s.parse::<f64>().ok())
                                 .unwrap_or(0.99);
 
-                            let strat = crate::strategy_gabagool::StrategyGabagool::new(
+                            let strat = strategy_gabagool::StrategyGabagool::new(
                                 state.clone(),
-                                poly_async.clone(),
+                                poly_client.clone(),
                                 buy_step,
                                 pair_cost_threshold,
                             )
