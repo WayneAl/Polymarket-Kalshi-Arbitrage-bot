@@ -215,7 +215,7 @@ async fn main() -> Result<()> {
                     let strategy_type = config
                         .active_strategy
                         .clone()
-                        .unwrap_or(crate::config::StrategyType::Strategy0x8dxd);
+                        .unwrap_or(crate::config::StrategyType::StrategyGabagool);
 
                     let handle = match strategy_type {
                         crate::config::StrategyType::Strategy0x8dxd => {

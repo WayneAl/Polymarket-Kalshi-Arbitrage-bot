@@ -39,15 +39,7 @@ impl StrategyGabagool {
     pub async fn run(mut self, dry_run: bool) {
         info!("[Gabagool] Running (dry_run={})", dry_run);
 
-        // Get a cloned notify handle from global state
-        let notify = {
-            let s = self.state.read().await;
-            s.poly_notify.clone()
-        };
-
         loop {
-            // Wait for a Polymarket update
-            notify.notified().await;
             // Snapshot necessary market data under read lock
             let mut snapshot: Vec<(u16, Arc<MarketPair>, u16, u16)> = Vec::new();
             {
@@ -65,6 +57,11 @@ impl StrategyGabagool {
                 if yes_cents == 0 || no_cents == 0 {
                     continue; // no price available
                 }
+
+                // println!(
+                //     "market_id: {}, yes_cents: {}, no_cents: {}",
+                //     market_id, yes_cents, no_cents
+                // );
 
                 let yes_price = cents_to_price(yes_cents);
                 let no_price = cents_to_price(no_cents);
@@ -88,17 +85,27 @@ impl StrategyGabagool {
                     no_price
                 };
 
-                // Stop condition: locked profit
-                if (qty_yes.min(qty_no)) > (cost_yes + cost_no) {
-                    info!("[Gabagool:{}] Profit locked, skipping", market_id);
-                    continue;
-                }
+                // // Stop condition: locked profit
+                // if (qty_yes.min(qty_no)) > (cost_yes + cost_no) {
+                //     info!(
+                //         "[Gabagool:{}] Profit locked profit:{} cost: {}",
+                //         market_id,
+                //         qty_yes.min(qty_no),
+                //         cost_yes + cost_no
+                //     );
+                //     continue;
+                // }
 
                 // Try YES
                 let new_qty_yes = qty_yes + self.buy_step;
                 let new_cost_yes = cost_yes + yes_price * self.buy_step;
                 let new_avg_yes = new_cost_yes / new_qty_yes;
                 let new_pair_cost_yes = new_avg_yes + avg_no;
+
+                // println!(
+                //     "[Gabagool:{}] yes_price: {}, no_price: {}, avg_yes: {:.4}, avg_no: {:.4}, new_pair_cost_yes: {:.4}, new_pair_cost_no: {:.4}",
+                //     market_id, yes_price, no_price, avg_yes, avg_no, new_pair_cost_yes, new_pair_cost_yes
+                // );
 
                 if new_pair_cost_yes < self.pair_cost_threshold {
                     info!(
@@ -109,7 +116,7 @@ impl StrategyGabagool {
                         let token = pair.poly_yes_token.to_string();
                         let _ = self
                             .client
-                            .buy_fak(&token, yes_price, self.buy_step, true)
+                            .buy_fak(&token, yes_price, self.buy_step, false)
                             .await;
                     }
                     *entry = (new_qty_yes, new_cost_yes, qty_no, cost_no);
@@ -132,15 +139,48 @@ impl StrategyGabagool {
                         let token = pair.poly_no_token.to_string();
                         let _ = self
                             .client
-                            .buy_fak(&token, no_price, self.buy_step, true)
+                            .buy_fak(&token, no_price, self.buy_step, false)
                             .await;
                     }
                     *entry = (qty_yes, cost_yes, new_qty_no, new_cost_no);
                 }
 
-                // small sleep between markets to avoid spamming
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                // init
+                if (cost_yes + cost_no) == 0.0 {
+                    if yes_price > no_price {
+                        // buy no
+                        info!(
+                            "[Gabagool:{}] Init: BUY NO @ {} -> new_pair_cost={:.4}",
+                            market_id, no_price, new_pair_cost_no
+                        );
+                        if !dry_run {
+                            let token = pair.poly_no_token.to_string();
+                            let _ = self
+                                .client
+                                .buy_fak(&token, no_price, self.buy_step, false)
+                                .await;
+                        }
+                        *entry = (qty_yes, cost_yes, new_qty_no, new_cost_no);
+                    } else {
+                        // buy yes
+                        info!(
+                            "[Gabagool:{}] Init: BUY YES @ {} -> new_pair_cost={:.4}",
+                            market_id, yes_price, new_pair_cost_yes
+                        );
+                        if !dry_run {
+                            let token = pair.poly_yes_token.to_string();
+                            let _ = self
+                                .client
+                                .buy_fak(&token, yes_price, self.buy_step, false)
+                                .await;
+                        }
+                        *entry = (new_qty_yes, new_cost_yes, qty_no, cost_no);
+                    }
+                }
             }
+
+            // small sleep between markets to avoid spamming
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
     }
 }

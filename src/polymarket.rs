@@ -229,7 +229,7 @@ impl GammaClient {
                                 Err(e) => warn!("[GAMMA] Failed to fetch price: {}", e),
                             }
                         }
-                        if strike_price.is_some() && ts_now < expiry_timestamp.unwrap() {
+                        if ts_now < expiry_timestamp.unwrap() {
                             // Synthesize a MarketPair
                             let pair = MarketPair {
                                 pair_id: Arc::from(format!("poly-{}", slug)),
@@ -491,13 +491,11 @@ async fn process_book(state: &Arc<tokio::sync::RwLock<GlobalState>>, book: &Book
     if let Some(&market_id) = s.poly_yes_to_id.get(&token_hash) {
         let market = &s.markets[market_id as usize];
         market.poly.update_yes(best_ask, ask_size);
-        s.poly_notify.notify_waiters();
     }
     // Check if NO token
     else if let Some(&market_id) = s.poly_no_to_id.get(&token_hash) {
         let market = &s.markets[market_id as usize];
         market.poly.update_no(best_ask, ask_size);
-        s.poly_notify.notify_waiters();
     }
 }
 
@@ -519,12 +517,10 @@ async fn process_price_change(
     if let Some(&market_id) = s.poly_yes_to_id.get(&token_hash) {
         let market = &s.markets[market_id as usize];
         market.poly.update_yes(price, parse_price("0"));
-        s.poly_notify.notify_waiters();
     }
     // Check NO token
     else if let Some(&market_id) = s.poly_no_to_id.get(&token_hash) {
         let market = &s.markets[market_id as usize];
         market.poly.update_no(price, parse_price("0"));
-        s.poly_notify.notify_waiters();
     }
 }

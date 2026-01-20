@@ -235,9 +235,6 @@ pub struct GlobalState {
     /// Market states indexed by market_id for O(1) access
     pub markets: Vec<AtomicMarketState>,
 
-    /// Notification for polymarket orderbook updates
-    pub poly_notify: Arc<Notify>,
-
     /// Next available market identifier (monotonically increasing)
     next_market_id: u16,
 
@@ -257,7 +254,6 @@ impl GlobalState {
 
         Self {
             markets,
-            poly_notify: Arc::new(Notify::new()),
             next_market_id: 0,
             poly_yes_to_id: FxHashMap::default(),
             poly_no_to_id: FxHashMap::default(),

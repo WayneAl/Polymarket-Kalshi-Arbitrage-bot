@@ -122,7 +122,7 @@ impl StrategyCopyTradeWS {
                     );
 
                     if !dry_run {
-                        if size >= 1.0 && usdc >= 1.0 {
+                        if size >= 1.0 && usdc >= 1.0 && fee == false {
                             let fill = self
                                 .client
                                 .buy_fak(&event.taker_asset_id.to_string(), price, size, fee)
