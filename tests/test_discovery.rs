@@ -1,4 +1,4 @@
-use prediction_market_arbitrage::polymarket::GammaClient;
+use prediction_market_arbitrage::polymarket::Client;
 
 #[tokio::test]
 async fn test_discover_15m_markets_live() {
@@ -7,7 +7,17 @@ async fn test_discover_15m_markets_live() {
         .try_init();
 
     // 1. Initialize Client
-    let client = GammaClient::new();
+    // We need valid-looking fake credentials because we don't want to fail on parsing
+    // but the functionality being tested (Gamma) doesn't typically require auth if implemented right.
+    // However, our Client::new implementation parses the PK.
+    // Use a random hex string for PK.
+    let dummy_pk = "0000000000000000000000000000000000000000000000000000000000000001";
+    let dummy_funder = "0x0000000000000000000000000000000000000000";
+    let host = "https://clob.polymarket.com";
+
+    let client = Client::new(host, 137, dummy_pk, dummy_funder)
+        .await
+        .expect("Failed to init client");
     println!("Fetching 15m markets from Gamma/Polymarket API...");
 
     // 2. Execute Discovery

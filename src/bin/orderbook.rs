@@ -19,12 +19,25 @@ async fn main() -> Result<()> {
     // Load config just for assets
     let config = config::load_config("config.json").unwrap_or_default();
 
+    // Load .env
+    dotenvy::dotenv().ok();
+
     // Globals
     let state = Arc::new(tokio::sync::RwLock::new(GlobalState::new()));
-    let gamma = polymarket::GammaClient::new();
+
+    // Init Client with sensitive data from env
+    let pk = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
+    let funder = std::env::var("FUNDER").ok().unwrap_or_default(); // Funder optional? Or use same address?
+                                                                   // Host and ChainID
+    let host = "https://clob.polymarket.com";
+    let chain_id = 137;
+
+    let client = polymarket::Client::new(host, chain_id, &pk, &funder)
+        .await
+        .expect("Failed to initialize Polymarket Client");
 
     info!("🔍 Discovering markets...");
-    let pairs = gamma.discover_15m_markets().await?;
+    let pairs = client.discover_15m_markets().await?;
     info!("✅ Found {} markets", pairs.len());
 
     {

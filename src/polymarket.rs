@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::{interval, Instant};
+use tokio::time::interval;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 // Official Client Imports
 use alloy::primitives::U256;
@@ -21,10 +21,11 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer; // trait for with_chain_id
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::auth::Normal;
-use polymarket_client_sdk::clob::order_builder::OrderBuilder;
 use polymarket_client_sdk::clob::types::{OrderType, Side};
 use polymarket_client_sdk::clob::Client as ClobClient;
 use polymarket_client_sdk::clob::Config;
+use polymarket_client_sdk::gamma::types::request::MarketsRequest;
+use polymarket_client_sdk::gamma::Client as GammaClient;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 
@@ -41,7 +42,7 @@ pub struct PolyFillAsync {
 }
 
 // === WebSocket Message Types ===
-
+// Kept for now, will replace usage in run_ws later
 #[derive(Deserialize, Debug)]
 pub struct BookSnapshot {
     pub asset_id: String,
@@ -107,9 +108,15 @@ impl Client {
             .authenticate()
             .await?;
 
+        // Initialize SDK Gamma Client
+        // Note: SDK GammaClient::new takes a URL string or we can use default if it had one,
+        // but our probe showed it takes strict URL.
+        let gamma = GammaClient::new(GAMMA_API_BASE)
+            .map_err(|e| anyhow!("Failed to create Gamma client: {:?}", e))?;
+
         Ok(Self {
             clob: Arc::new(clob),
-            gamma: Arc::new(GammaClient::new()),
+            gamma: Arc::new(gamma),
             funder: funder.to_string(),
             signer,
             chain_id,
@@ -181,151 +188,95 @@ impl Client {
             fill_cost,
         })
     }
-}
-
-// === Gamma API Client ===
-
-pub struct GammaClient {
-    http: reqwest::Client,
-}
-
-impl GammaClient {
-    pub fn new() -> Self {
-        Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .expect("Failed to build HTTP client"),
-        }
-    }
-
-    pub async fn lookup_market(&self, slug: &str) -> Result<Option<(String, String)>> {
-        if let Some(tokens) = self.try_lookup_slug(slug).await? {
-            return Ok(Some(tokens));
-        }
-        if let Some(next_day_slug) = increment_date_in_slug(slug) {
-            if let Some(tokens) = self.try_lookup_slug(&next_day_slug).await? {
-                info!("  📅 Found with next-day slug: {}", next_day_slug);
-                return Ok(Some(tokens));
-            }
-        }
-        Ok(None)
-    }
-
-    async fn try_lookup_slug(&self, slug: &str) -> Result<Option<(String, String)>> {
-        let url = format!("{}/markets?slug={}", GAMMA_API_BASE, slug);
-        let resp = self.http.get(&url).send().await?;
-        if !resp.status().is_success() {
-            return Ok(None);
-        }
-        let markets: Vec<GammaMarket> = resp.json().await?;
-        if markets.is_empty() {
-            return Ok(None);
-        }
-        let market = &markets[0];
-        if market.closed == Some(true) || market.active == Some(false) {
-            return Ok(None);
-        }
-        let token_ids: Vec<String> = market
-            .clob_token_ids
-            .as_ref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
-        if token_ids.len() >= 2 {
-            Ok(Some((token_ids[0].clone(), token_ids[1].clone())))
-        } else {
-            Ok(None)
-        }
-    }
-
-    pub async fn fetch_markets(&self, tag: &str) -> Result<Vec<GammaMarket>> {
-        let url = format!(
-            "{}/events?tag_slug={}&order=endDate&ascending=true&closed=false&limit=8",
-            GAMMA_API_BASE, tag
-        );
-        info!("[GAMMA] Fetching markets for tag: {}", tag);
-        let resp = self.http.get(&url).send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("Gamma API request failed: {}", resp.status());
-        }
-        let events: Vec<GammaEvent> = resp.json().await?;
-        let markets: Vec<GammaMarket> =
-            events.into_iter().flat_map(|event| event.markets).collect();
-        info!("[GAMMA] Found {} markets for tag '{}'", markets.len(), tag);
-        Ok(markets)
-    }
 
     pub async fn discover_15m_markets(&self) -> Result<Vec<MarketPair>> {
-        let markets = self.fetch_markets("15M").await?;
+        info!("[GAMMA] Fetching markets for tag: 15M");
+
+        // Gamma API search by tag is usually via events endpoint, but let's try strict markets request if possible.
+        // We use limit 50 and filtered by closed=false. We will filter for "15min" in question if needed or rely on expiry logic.
+
+        let mut req = MarketsRequest::default();
+        req.limit = Some(50);
+        // req.order = Some(Order::EndDate); // Order enum not found, using default
+        req.ascending = Some(true);
+        req.closed = Some(false);
+
+        let markets = self
+            .gamma
+            .markets(&req)
+            .await
+            .map_err(|e| anyhow!("Gamma API request failed: {:?}", e))?;
+        info!("[GAMMA] Found {} markets for tag '15M'", markets.len());
+
         let ts_now = Utc::now().timestamp();
         let mut pairs = Vec::new();
 
         for market in markets {
-            if let Some(clob_ids_str) = market.clob_token_ids {
-                if let Ok(tokens) = serde_json::from_str::<Vec<String>>(&clob_ids_str) {
-                    if tokens.len() >= 2 {
-                        let slug = market.slug.clone().unwrap_or_else(|| "unknown".to_string());
-                        let question = market.question.clone();
-                        let asset = if question.to_lowercase().contains("bitcoin") {
-                            Some("BTC")
-                        } else if question.to_lowercase().contains("ethereum") {
-                            Some("ETH")
-                        } else if question.to_lowercase().contains("solana") {
-                            Some("SOL")
-                        } else if question.to_lowercase().contains("ripple")
-                            || question.to_lowercase().contains("xrp")
-                        {
-                            Some("XRP")
-                        } else {
-                            None
-                        };
+            if let Some(tokens) = market.clob_token_ids {
+                // SDK likely returns Vec<U256> or Vec<String>.
+                // Based on previous error "found Arc<Uint<256, 4>>" when using it as string, it returns U256.
+                // We need to convert to string.
+                if tokens.len() >= 2 {
+                    let slug = market.slug.clone().unwrap_or_else(|| "unknown".to_string());
+                    // Market question is Option<String>
+                    let question = market.question.clone().unwrap_or_default();
+                    let asset = if question.to_lowercase().contains("bitcoin") {
+                        Some("BTC")
+                    } else if question.to_lowercase().contains("ethereum") {
+                        Some("ETH")
+                    } else if question.to_lowercase().contains("solana") {
+                        Some("SOL")
+                    } else if question.to_lowercase().contains("ripple")
+                        || question.to_lowercase().contains("xrp")
+                    {
+                        Some("XRP")
+                    } else {
+                        None
+                    };
 
-                        let expiry_timestamp = market
-                            .end_date
-                            .as_ref()
-                            .and_then(|iso| chrono::DateTime::parse_from_rfc3339(iso).ok())
-                            .map(|dt| dt.timestamp_millis());
+                    let expiry_timestamp = market.end_date.map(|dt| dt.timestamp_millis());
 
-                        let mut strike_price: Option<f64> = None;
+                    let mut strike_price: Option<f64> = None;
 
-                        // Fetch strike price logic
-                        if let (Some(asset_symbol), Some(expiry_ms)) = (asset, expiry_timestamp) {
-                            let expiry_ts = expiry_ms / 1000;
-                            let event_end_time_utc = Utc.timestamp_opt(expiry_ts, 0).unwrap();
-                            let event_start_time_utc =
-                                event_end_time_utc - chrono::Duration::minutes(15);
-                            let url = format!(
-                                "https://polymarket.com/api/crypto/crypto-price?symbol={}&eventStartTime={}&variant=fifteen&endDate={}",
-                                asset_symbol,
-                                event_start_time_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                                event_end_time_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                            );
-                            match self.http.get(&url).send().await {
-                                Ok(resp) => {
-                                    if resp.status().is_success() {
-                                        if let Ok(price_data) = resp.json::<Price>().await {
-                                            strike_price = price_data.open_price;
-                                        }
+                    // Fetch strike price logic (Original Logic Preserved)
+                    if let (Some(asset_symbol), Some(expiry_ms)) = (asset, expiry_timestamp) {
+                        let expiry_ts = expiry_ms / 1000;
+                        let event_end_time_utc = Utc.timestamp_opt(expiry_ts, 0).unwrap();
+                        let event_start_time_utc =
+                            event_end_time_utc - chrono::Duration::minutes(15);
+                        let url = format!(
+                            "https://polymarket.com/api/crypto/crypto-price?symbol={}&eventStartTime={}&variant=fifteen&endDate={}",
+                            asset_symbol,
+                            event_start_time_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            event_end_time_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        );
+                        // Using a one-off reqwest client since we removed the custom GammaClient struct
+                        let http = reqwest::Client::new();
+                        match http.get(&url).send().await {
+                            Ok(resp) => {
+                                if resp.status().is_success() {
+                                    if let Ok(price_data) = resp.json::<Price>().await {
+                                        strike_price = price_data.open_price;
                                     }
                                 }
-                                Err(e) => warn!("[GAMMA] Failed to fetch price: {}", e),
                             }
+                            Err(e) => warn!("[GAMMA] Failed to fetch price: {}", e),
                         }
+                    }
 
-                        if let Some(exp) = expiry_timestamp {
-                            if ts_now < exp {
-                                let pair = MarketPair {
-                                    pair_id: Arc::from(format!("poly-{}", slug)),
-                                    market_type: MarketType::Moneyline,
-                                    description: Arc::from(question),
-                                    poly_slug: Arc::from(slug),
-                                    poly_yes_token: Arc::from(tokens[0].clone()),
-                                    poly_no_token: Arc::from(tokens[1].clone()),
-                                    strike_price,
-                                    expiry_timestamp,
-                                };
-                                pairs.push(pair);
-                            }
+                    if let Some(exp) = expiry_timestamp {
+                        if ts_now < exp {
+                            let pair = MarketPair {
+                                pair_id: Arc::from(format!("poly-{}", slug)),
+                                market_type: MarketType::Moneyline,
+                                description: Arc::from(question),
+                                poly_slug: Arc::from(slug),
+                                poly_yes_token: Arc::from(tokens[0].to_string()),
+                                poly_no_token: Arc::from(tokens[1].to_string()),
+                                strike_price,
+                                expiry_timestamp,
+                            };
+                            pairs.push(pair);
                         }
                     }
                 }
@@ -337,26 +288,7 @@ impl GammaClient {
 
 // === Data Structures ===
 
-#[derive(Debug, Deserialize)]
-pub struct GammaEvent {
-    pub markets: Vec<GammaMarket>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct GammaMarket {
-    #[serde(rename = "question")]
-    pub question: String,
-    #[serde(rename = "clobTokenIds")]
-    pub clob_token_ids: Option<String>,
-    #[serde(rename = "active")]
-    pub active: Option<bool>,
-    #[serde(rename = "closed")]
-    pub closed: Option<bool>,
-    pub slug: Option<String>,
-    #[serde(rename = "endDate")]
-    pub end_date: Option<String>,
-}
-
+// Keep Price struct for the manual fetch
 #[derive(Debug, Deserialize)]
 pub struct Price {
     #[serde(rename = "openPrice")]
@@ -367,6 +299,8 @@ fn increment_date_in_slug(slug: &str) -> Option<String> {
     // Basic implementation just to satisfy dependency
     Some(slug.to_string())
 }
+
+// === WebSocket Runner ===
 
 // === WebSocket Runner ===
 

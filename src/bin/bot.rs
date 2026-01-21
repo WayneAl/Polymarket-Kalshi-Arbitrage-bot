@@ -11,7 +11,7 @@ use tracing::{error, info, warn, Level};
 // Import from the library crate
 use prediction_market_arbitrage::{
     binance_ws, config, polymarket, strategy_0x8dxd, strategy_copy_trade, strategy_gabagool,
-    types::{GlobalState, MarketPair, MarketType},
+    types::GlobalState,
 };
 
 use polymarket::Client;
@@ -89,9 +89,6 @@ async fn main() -> Result<()> {
     tokio::spawn(binance_driver.run());
 
     // 4. Discovery Setup
-    // Use the gamma client from the wrapper
-    let gamma_client = poly_client.gamma.clone();
-
     // Trackers
     let mut poly_ws_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut active_strategies: std::collections::HashMap<u16, tokio::task::JoinHandle<()>> =
@@ -103,7 +100,7 @@ async fn main() -> Result<()> {
             info!("🔄 Starting Discovery (Time: {})", chrono::Local::now());
 
             // A. Discovery
-            match gamma_client.discover_15m_markets().await {
+            match poly_client.discover_15m_markets().await {
                 // Trackers
                 Ok(pairs) => {
                     info!("🔎 Discovered {} potential markets", pairs.len());
@@ -178,10 +175,7 @@ async fn main() -> Result<()> {
                         pair.pair_id, asset_cfg.symbol
                     );
 
-                    let strategy_type = config
-                        .active_strategy
-                        .clone()
-                        .unwrap_or(crate::config::StrategyType::StrategyGabagool);
+                    let strategy_type = config.active_strategy.clone().unwrap();
 
                     let handle = match strategy_type {
                         crate::config::StrategyType::Strategy0x8dxd => {
