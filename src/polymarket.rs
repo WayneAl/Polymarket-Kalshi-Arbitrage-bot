@@ -32,6 +32,7 @@ use rust_decimal::Decimal;
 
 use crate::config::{GAMMA_API_BASE, POLYMARKET_WS_URL, POLY_PING_INTERVAL_SECS};
 use crate::types::{fxhash_str, parse_price, GlobalState, MarketPair, MarketType, SizeCents};
+use polymarket_client_sdk::rtds::ChainlinkPrice;
 use polymarket_client_sdk::rtds::CryptoPrice;
 
 // === Types ===
@@ -98,9 +99,10 @@ pub struct Client {
     pub funder: String,
     pub signer: PrivateKeySigner,
     pub chain_id: u64,
-    // Broadcast channel for price updates (shared across strategies)
-    price_tx: tokio::sync::broadcast::Sender<CryptoPrice>,
-    // Task handle for the global price feed
+    // Broadcast channels for price updates (shared across strategies)
+    crypto_price_tx: tokio::sync::broadcast::Sender<CryptoPrice>,
+    chainlink_price_tx: tokio::sync::broadcast::Sender<ChainlinkPrice>,
+    // Task handles for the global price feeds
     price_feed_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
@@ -133,8 +135,9 @@ impl Client {
 
         let rtds = RtdsClient::default();
 
-        // Create broadcast channel for price updates (large buffer to avoid dropping messages)
-        let (price_tx, _) = tokio::sync::broadcast::channel(1000);
+        // Create broadcast channels for price updates (large buffer to avoid dropping messages)
+        let (crypto_price_tx, _) = tokio::sync::broadcast::channel(1000);
+        let (chainlink_price_tx, _) = tokio::sync::broadcast::channel(1000);
 
         Ok(Self {
             clob: Arc::new(clob),
@@ -143,13 +146,14 @@ impl Client {
             funder: funder.to_string(),
             signer,
             chain_id: POLYGON_CHAIN_ID,
-            price_tx,
+            crypto_price_tx,
+            chainlink_price_tx,
             price_feed_task: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
-    /// Start the global price feed that broadcasts crypto prices to all strategies
-    /// This should be called once at startup, and strategies subscribe via subscribe_prices()
+    /// Start the global price feed that broadcasts crypto and chainlink prices to all strategies
+    /// This should be called once at startup, and strategies subscribe via subscribe_prices() or subscribe_chainlink_prices()
     pub async fn start_price_feed(&self) -> Result<()> {
         let mut task_guard = self.price_feed_task.lock().await;
 
@@ -159,41 +163,86 @@ impl Client {
         }
 
         let rtds_client = self.rtds.clone();
-        let price_tx = self.price_tx.clone();
+        let crypto_price_tx = self.crypto_price_tx.clone();
+        let chainlink_price_tx = self.chainlink_price_tx.clone();
 
         let handle = tokio::spawn(async move {
-            // Subscribe to all crypto prices
-            match rtds_client.subscribe_crypto_prices(None) {
-                Ok(stream) => {
-                    let mut price_stream = Box::pin(stream);
+            // Subscribe to crypto prices
+            let crypto_task = {
+                let rtds_client = rtds_client.clone();
+                let crypto_price_tx = crypto_price_tx.clone();
+                tokio::spawn(async move {
+                    match rtds_client.subscribe_crypto_prices(None) {
+                        Ok(stream) => {
+                            let mut price_stream = Box::pin(stream);
 
-                    while let Some(msg) = price_stream.next().await {
-                        match msg {
-                            Ok(price) => {
-                                // Broadcast to all strategies (ignore if no subscribers)
-                                let _ = price_tx.send(price);
-                            }
-                            Err(e) => {
-                                warn!("[PRICE_FEED] Stream error: {}", e);
+                            while let Some(msg) = price_stream.next().await {
+                                match msg {
+                                    Ok(price) => {
+                                        let _ = crypto_price_tx.send(price);
+                                    }
+                                    Err(e) => {
+                                        warn!("[PRICE_FEED] Crypto stream error: {}", e);
+                                    }
+                                }
                             }
                         }
+                        Err(e) => {
+                            error!("[PRICE_FEED] Failed to subscribe to crypto prices: {}", e);
+                        }
                     }
-                }
-                Err(e) => {
-                    error!("[PRICE_FEED] Failed to subscribe: {}", e);
-                }
-            }
+                })
+            };
+
+            // Subscribe to chainlink prices
+            let chainlink_task = {
+                let rtds_client = rtds_client.clone();
+                let chainlink_price_tx = chainlink_price_tx.clone();
+                tokio::spawn(async move {
+                    match rtds_client.subscribe_chainlink_prices(None) {
+                        Ok(stream) => {
+                            let mut price_stream = Box::pin(stream);
+
+                            while let Some(msg) = price_stream.next().await {
+                                match msg {
+                                    Ok(price) => {
+                                        let _ = chainlink_price_tx.send(price);
+                                    }
+                                    Err(e) => {
+                                        warn!("[PRICE_FEED] Chainlink stream error: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                "[PRICE_FEED] Failed to subscribe to chainlink prices: {}",
+                                e
+                            );
+                        }
+                    }
+                })
+            };
+
+            // Wait for both tasks (they run indefinitely)
+            let _ = tokio::join!(crypto_task, chainlink_task);
         });
 
         *task_guard = Some(handle);
-        info!("[PRICE_FEED] Global price feed started");
+        info!("[PRICE_FEED] Global price feed started (crypto + chainlink)");
         Ok(())
     }
 
-    /// Subscribe to price updates for a specific symbol
+    /// Subscribe to crypto price updates
     /// Returns a broadcast receiver that will receive CryptoPrice updates
     pub fn subscribe_prices(&self) -> tokio::sync::broadcast::Receiver<CryptoPrice> {
-        self.price_tx.subscribe()
+        self.crypto_price_tx.subscribe()
+    }
+
+    /// Subscribe to chainlink price updates
+    /// Returns a broadcast receiver that will receive ChainlinkPrice updates
+    pub fn subscribe_chainlink_prices(&self) -> tokio::sync::broadcast::Receiver<ChainlinkPrice> {
+        self.chainlink_price_tx.subscribe()
     }
 
     /// Execute FAK buy order

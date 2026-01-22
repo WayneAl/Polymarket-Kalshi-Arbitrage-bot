@@ -2,19 +2,23 @@
 
 ## 快速總結
 
-已將 RTDS WebSocket 訂閱從各個策略中剝離出來，集中在 `Client` 中管理。多個策略現在通過 **tokio broadcast channel** 共享單一的全局價格 feed。
+已將 RTDS WebSocket 訂閱從各個策略中剝離出來，集中在 `Client` 中管理。多個策略現在通過 **tokio broadcast channel** 共享：
+
+- **Crypto 價格** - 所有加密貨幣
+- **Chainlink 價格** - 所有 Chainlink 資產
 
 ## 關鍵改動
 
-### 1️⃣ Client 中的全局價格 Feed
+### 1️⃣ Client 中的雙軌全局價格 Feed
 
 **檔案**: [src/polymarket.rs](src/polymarket.rs#L100-L110)
 
 ```rust
 pub struct Client {
     pub rtds: Arc<RtdsClient>,
-    price_tx: tokio::sync::broadcast::Sender<CryptoPrice>,        // 發送端
-    price_feed_task: Arc<tokio::sync::Mutex<...>>,                // 後台任務
+    crypto_price_tx: tokio::sync::broadcast::Sender<CryptoPrice>,      // Crypto feed
+    chainlink_price_tx: tokio::sync::broadcast::Sender<ChainlinkPrice>, // Chainlink feed
+    price_feed_task: Arc<tokio::sync::Mutex<...>>,
 }
 ```
 
@@ -29,7 +33,7 @@ poly_client.start_price_feed().await?;  // ⭐ 必須調用一次！
 
 ### 3️⃣ 策略訂閱價格
 
-**檔案**: [src/strategy_0x8dxd.rs](src/strategy_0x8dxd.rs#L130)
+**Crypto 價格** [src/strategy_0x8dxd.rs](src/strategy_0x8dxd.rs#L130)
 
 ```rust
 let mut price_rx = self.client.subscribe_prices();
@@ -42,35 +46,51 @@ while let Ok(price) = price_rx.recv().await {
 }
 ```
 
+**Chainlink 價格**（如果策略需要）
+
+```rust
+let mut chainlink_rx = self.client.subscribe_chainlink_prices();
+
+while let Ok(price) = chainlink_rx.recv().await {
+    // 處理 Chainlink 價格
+    self.process_chainlink(&price).await?;
+}
+```
+
 ## 為什麼這樣設計？
 
-| 問題                 | 舊方案                      | 新方案               |
-| -------------------- | --------------------------- | -------------------- |
-| **WebSocket 連接數** | N（策略數）                 | 1 個                 |
-| **複雜度**           | `Box::pin()` + Stream trait | 簡單 broadcast RX    |
-| **資源使用**         | 高                          | 低                   |
-| **延遲**             | 因訂閱速度變化              | 均勻（所有策略同步） |
+| 問題                 | 舊方案                      | 新方案                         |
+| -------------------- | --------------------------- | ------------------------------ |
+| **WebSocket 連接數** | N（策略數）                 | 2（Crypto + Chainlink）        |
+| **複雜度**           | `Box::pin()` + Stream trait | 簡單 broadcast RX              |
+| **資源使用**         | 高                          | 低                             |
+| **延遲**             | 因訂閱速度變化              | 均勻（所有策略同步）           |
+| **訂閱彈性**         | 必須訂閱所有                | 可選：Crypto、Chainlink 或兩者 |
 
 ## 實施流程
 
 ```
 1. Client::new()
-   ├─ 建立 broadcast channel (capacity: 1000)
-   └─ 保存 price_tx, price_feed_task
+   ├─ 建立 crypto broadcast channel (capacity: 1000)
+   └─ 建立 chainlink broadcast channel (capacity: 1000)
 
 2. start_price_feed()
    ├─ 檢查是否已運行
-   ├─ 訂閱 RTDS (None = 所有幣種)
-   ├─ 在後台 spawn 任務
-   ├─ 迴圈: 接收 -> 廣播
+   ├─ 並行 spawn 兩個訂閱任務:
+   │  ├─ 訂閱 RTDS crypto prices (None = 所有幣種)
+   │  └─ 訂閱 RTDS chainlink prices (None = 所有資產)
+   ├─ 迴圈 1: 接收 crypto -> 廣播到 crypto_tx
+   ├─ 迴圈 2: 接收 chainlink -> 廣播到 chainlink_tx
    └─ 錯誤時 warn 並繼續
+```
 
 3. Strategy::run()
    ├─ 調用 client.subscribe_prices()
    ├─ 取得 RX (接收端)
    ├─ 迴圈: 接收 -> 過濾 -> 處理
    └─ RX 自動關閉時退出
-```
+
+````
 
 ## 重要細節
 
@@ -83,7 +103,7 @@ poly_client.start_price_feed().await?;
 // 在策略中
 let price_rx = self.client.subscribe_prices();
 while let Ok(price) = price_rx.recv().await { ... }
-```
+````
 
 ### ❌ 別做這些
 

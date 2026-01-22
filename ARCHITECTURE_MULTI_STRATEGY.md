@@ -2,51 +2,38 @@
 
 ## 概述
 
-已將 RTDS 價格流整合到 `Client` 中，使用 **broadcast channel** 實現一個全局價格 feed，所有策略共享同一個 WebSocket 連接。
+已將 RTDS 價格流整合到 `Client` 中，使用 **broadcast channel** 實現雙軌全局價格 feed（Crypto + Chainlink），所有策略共享同一個 RTDS WebSocket 連接。
 
 ## 架構設計
 
-### 之前（單一策略訂閱）
+### 之後（全局 Broadcast - Crypto + Chainlink）
 
 ```
-Strategy 1 ──→ RTDS Client ──→ WebSocket (subscribe)
-Strategy 2 ──→ RTDS Client ──→ WebSocket (subscribe)  ❌ 重複連接
-Strategy N ──→ RTDS Client ──→ WebSocket (subscribe)
-```
-
-**問題**：
-
-- 多個策略 = 多個 WebSocket 連接
-- 浪費網路資源和服務器連接
-- 每個策略都需要過濾不相關的價格
-
-### 之後（全局 Broadcast）
-
-```
-┌─────────────────────────────────────────────────────┐
-│                    Client                           │
-│  ┌──────────────────────────────────────────────┐  │
-│  │  Global Price Feed (tokio::spawn)             │  │
-│  │  - Single WebSocket connection to RTDS        │  │
-│  │  - Receives: ALL crypto prices                │  │
-│  │  - Broadcasts to all strategies               │  │
-│  │  stream -> broadcast::Sender<CryptoPrice>     │  │
-│  └──────────────────────────────────────────────┘  │
-│              ↑                                       │
-│         RTDS WebSocket (ONE connection)             │
-└─────────────────────────────────────────────────────┘
-           ↓
-    Broadcast Channel (1000 capacity)
-   /        |        \
-  ↓         ↓        ↓
-Strat1   Strat2   StrayN
-(RX 1)   (RX 2)   (RX N)
+┌──────────────────────────────────────────────────────┐
+│                    Client                            │
+│  ┌────────────────────────────────────────────────┐  │
+│  │  Global Price Feeds (tokio::spawn)             │  │
+│  │  ┌──────────────────┐  ┌──────────────────┐   │  │
+│  │  │  Crypto Feed     │  │  Chainlink Feed  │   │  │
+│  │  │ (ALL cryptocurs) │  │  (ALL chainlink) │   │  │
+│  │  └────────┬─────────┘  └────────┬─────────┘   │  │
+│  │           ↓                     ↓              │  │
+│  │  BroadcastSender<CryptoPrice>   BroadcastSender<ChainlinkPrice>
+│  └────────────────────────────────────────────────┘  │
+│    ↓                               ↓                 │
+│  Crypto Channel                   Chainlink Channel  │
+│  (capacity: 1000)                 (capacity: 1000)   │
+└──────────────────────────────────────────────────────┘
+   / | \                                / | \
+  ↓  ↓  ↓                              ↓  ↓  ↓
+Strat1 Strat2 ... (crypto RX)    Strat1 Strat2 ... (chainlink RX)
 ```
 
 **優勢**：
 
-- ✅ **單一 WebSocket 連接** 服務所有策略
-- ✅ **低延遲** 所有策略同時接收價格
+- ✅ **2 個 WebSocket 連接**（Crypto + Chainlink）服務所有策略
+- ✅ **獨立訂閱** 策略可以只訂閱需要的 feed（兩者或其中之一）
+- ✅ **低延遲** 所有策略同時接收同類型價格
 - ✅ **高效率** broadcast channel 零複製分發
 - ✅ **簡潔** 策略無需關心 Stream 的複雜性
 
@@ -60,8 +47,9 @@ pub struct Client {
     // ... 既有字段 ...
     pub rtds: Arc<RtdsClient>,
 
-    // NEW: Broadcast channel for price updates
-    price_tx: tokio::sync::broadcast::Sender<CryptoPrice>,
+    // NEW: Broadcast channels for dual price feeds
+    crypto_price_tx: tokio::sync::broadcast::Sender<CryptoPrice>,
+    chainlink_price_tx: tokio::sync::broadcast::Sender<ChainlinkPrice>,
     price_feed_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 ```
@@ -70,29 +58,41 @@ pub struct Client {
 
 #### `start_price_feed()`
 
-在 bot 啟動時調用，啟動全局價格監聽任務。
+在 bot 啟動時調用，啟動兩個全局價格監聽任務（Crypto + Chainlink）。
 
 ```rust
 pub async fn start_price_feed(&self) -> Result<()> {
-    // Subscribe to RTDS (all prices)
-    // Pin stream, iterate and broadcast to all strategies
+    // Subscribe to RTDS crypto prices (all)
+    // Subscribe to RTDS chainlink prices (all)
+    // Run both in parallel using tokio::join!
 }
 ```
 
 **特點**：
 
 - 只啟動一次（checked by `task_guard`）
-- 訂閱 **所有** 幣種（`None` 參數）
-- 捕捉所有錯誤並以 warn 級別記錄
-- 任務在後台運行
+- 訂閱 **所有** Crypto 幣種（`None` 參數）
+- 訂閱 **所有** Chainlink 資產（`None` 參數）
+- 各自捕捉錯誤並以 warn 級別記錄
+- 兩個任務在後台並行運行
 
 #### `subscribe_prices()`
 
-策略調用此方法獲得廣播接收器。
+策略調用此方法獲得 Crypto 廣播接收器。
 
 ```rust
 pub fn subscribe_prices(&self) -> tokio::sync::broadcast::Receiver<CryptoPrice> {
-    self.price_tx.subscribe()
+    self.crypto_price_tx.subscribe()
+}
+```
+
+#### `subscribe_chainlink_prices()`
+
+策略調用此方法獲得 Chainlink 廣播接收器。
+
+```rust
+pub fn subscribe_chainlink_prices(&self) -> tokio::sync::broadcast::Receiver<ChainlinkPrice> {
+    self.chainlink_price_tx.subscribe()
 }
 ```
 
@@ -144,14 +144,15 @@ poly_client.start_price_feed().await?;
 
 ## Broadcast Channel 的優勢
 
-| 特性       | 直接訂閱 RTDS     | Broadcast Channel          |
-| ---------- | ----------------- | -------------------------- |
-| 連接數     | N（策略數）       | 1                          |
-| 資料複製   | 每個策略一份      | 零複製共享                 |
-| API 複雜度 | 需要 `Box::pin()` | 簡單 RX 語法               |
-| 過濾位置   | 網路側（伺服器）  | 本地（CPU 緩存）           |
-| 訂閱延遲   | 策略啟動時+300ms  | 立即（已有 1000 消息緩衝） |
-| 錯誤恢復   | 需逐個重連        | 全局管理                   |
+| 特性       | 直接訂閱 RTDS     | Broadcast Channel（雙軌）      |
+| ---------- | ----------------- | ------------------------------ |
+| 連接數     | N（策略數）       | 2（Crypto + Chainlink）        |
+| 資料複製   | 每個策略一份      | 零複製共享                     |
+| API 複雜度 | 需要 `Box::pin()` | 簡單 RX 語法                   |
+| 過濾位置   | 網路側（伺服器）  | 本地（CPU 緩存）               |
+| 訂閱延遲   | 策略啟動時+300ms  | 立即（已有 1000 消息緩衝）     |
+| 獨立訂閱   | 必須訂閱所有      | 可選：Crypto、Chainlink 或兩者 |
+| 錯誤恢復   | 需逐個重連        | 全局管理                       |
 
 ## 實現細節
 

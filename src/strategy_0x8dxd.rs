@@ -11,7 +11,7 @@ use tracing::{error, info, warn};
 
 use crate::polymarket::Client;
 use crate::types::GlobalState;
-use polymarket_client_sdk::rtds::CryptoPrice;
+use polymarket_client_sdk::rtds::{ChainlinkPrice, CryptoPrice};
 use rust_decimal::prelude::ToPrimitive;
 
 // Configurable parameters
@@ -41,6 +41,9 @@ pub struct Strategy0x8dxd {
     binance_ref_price: f64,
 
     default_sigma: f64,
+
+    // Store latest chainlink price (updated in background)
+    latest_chainlink_price: Arc<tokio::sync::Mutex<Option<ChainlinkPrice>>>,
 }
 
 impl Strategy0x8dxd {
@@ -115,6 +118,7 @@ impl Strategy0x8dxd {
             expiry_ts,
             binance_ref_price,
             default_sigma,
+            latest_chainlink_price: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -130,17 +134,53 @@ impl Strategy0x8dxd {
 
         info!("[0x8dxd] Strategy loop started for {}", pair_id);
 
-        // Subscribe to the global price feed
-        let mut price_rx = self.client.subscribe_prices();
+        // Subscribe to both feeds
+        let mut crypto_rx = self.client.subscribe_prices();
+        let mut chainlink_rx = self.client.subscribe_chainlink_prices();
         let asset_lower = self.asset.to_lowercase();
+        let latest_chainlink = self.latest_chainlink_price.clone();
 
-        while let Ok(price) = price_rx.recv().await {
+        // Background task: continuously update latest chainlink price
+        tokio::spawn({
+            let latest_chainlink = latest_chainlink.clone();
+            let asset_lower = asset_lower.clone();
+            async move {
+                while let Ok(price) = chainlink_rx.recv().await {
+                    // Filter for this strategy's asset
+                    if !price.symbol.to_lowercase().starts_with(&asset_lower) {
+                        continue;
+                    }
+                    *latest_chainlink.lock().await = Some(price);
+                }
+            }
+        });
+
+        // Main task: process crypto prices with access to latest chainlink
+        while let Ok(price) = crypto_rx.recv().await {
             // Filter for this strategy's asset
             if !price.symbol.to_lowercase().starts_with(&asset_lower) {
                 continue;
             }
 
-            match self.process_tick(&price, dry_run).await {
+            // Get latest chainlink price if available
+            let chainlink_price = latest_chainlink.lock().await.clone();
+            if chainlink_price.is_none() {
+                continue;
+            }
+            let chainlink_price = chainlink_price.unwrap();
+
+            info!(
+                "[0x8dxd] Crypto: {} ({}), Chainlink: {} ({}), Delta: {}",
+                price.value,
+                &price.symbol,
+                chainlink_price.value,
+                &chainlink_price.symbol,
+                (price.value - chainlink_price.value)
+            );
+
+            let price = chainlink_price.value.to_f64().unwrap_or(0.0);
+
+            match self.process_tick(price, dry_run).await {
                 Ok(should_stop) => {
                     if should_stop {
                         info!("[0x8dxd] Strategy expired for {}", pair_id);
@@ -154,9 +194,7 @@ impl Strategy0x8dxd {
     }
 
     /// Returns Ok(true) if the strategy should stop (expired), Ok(false) otherwise.
-    async fn process_tick(&mut self, price_update: &CryptoPrice, dry_run: bool) -> Result<bool> {
-        let price = price_update.value.to_f64().unwrap_or_default();
-
+    async fn process_tick(&mut self, price: f64, dry_run: bool) -> Result<bool> {
         if price == 0.0 {
             return Ok(false);
         }
@@ -166,7 +204,7 @@ impl Strategy0x8dxd {
         self.update_history(now_exec, price);
 
         // Calculate Realized Volatility (Annualized)
-        let mut sigma = self.get_iv().unwrap_or(0.5);
+        let mut sigma = self.get_iv().unwrap_or(self.default_sigma);
         sigma = sigma.max(self.default_sigma);
 
         // check timestamp from price? rtds price has timestamp usually
@@ -174,42 +212,37 @@ impl Strategy0x8dxd {
         let now_ts = Utc::now().timestamp();
         let time_remaining_secs = self.expiry_ts - now_ts;
 
-        if time_remaining_secs <= 60 {
+        if time_remaining_secs <= 0 {
+            info!("[0x8dxd] Market expired, settle at {}", price);
             return Ok(true);
         }
 
         let time_to_expiry_years = time_remaining_secs as f64 / (365.0 * 24.0 * 3600.0);
 
-        let calibrated_price = if self.binance_ref_price > 0.0 {
-            let offset = self.binance_ref_price - self.strike_price;
-            price - offset
-        } else {
-            price
-        };
+        // let price = if self.binance_ref_price > 0.0 {
+        //     let offset = self.binance_ref_price - self.strike_price;
+        //     price - offset
+        // } else {
+        //     price
+        // };
 
         if self.strike_price == 0.0 {
             return Ok(false);
         }
 
         let fair_prob_yes = match self.pricing_model {
-            PricingModel::BlackScholes => Self::calculate_prob_bs(
-                calibrated_price,
-                self.strike_price,
-                time_to_expiry_years,
-                sigma,
-            ),
-            PricingModel::MonteCarlo => Self::calculate_prob_mc(
-                calibrated_price,
-                self.strike_price,
-                time_to_expiry_years,
-                sigma,
-            ),
+            PricingModel::BlackScholes => {
+                Self::calculate_prob_bs(price, self.strike_price, time_to_expiry_years, sigma)
+            }
+            PricingModel::MonteCarlo => {
+                Self::calculate_prob_mc(price, self.strike_price, time_to_expiry_years, sigma)
+            }
         };
 
         info!(
             target: "strategy_0x8dxd",
             "Price: {}, Strike: {}, Time: {}, Prob: {}s, Sigma: {}",
-            calibrated_price, self.strike_price, time_remaining_secs, fair_prob_yes, sigma
+            price, self.strike_price, time_remaining_secs, fair_prob_yes, sigma
         );
 
         let fair_prob_no = 1.0 - fair_prob_yes;
