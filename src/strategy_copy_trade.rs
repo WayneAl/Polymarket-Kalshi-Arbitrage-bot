@@ -11,17 +11,17 @@ use crate::types::GlobalState;
 const POLY_DATA_API: &str = "https://data-api.polymarket.com";
 
 #[derive(Debug, Deserialize)]
-struct ActivityItem {
+pub struct ActivityItem {
     #[serde(rename = "type")]
     activity_type: String, // "TRADE"
     #[allow(dead_code)]
     timestamp: u64,
-    side: String, // "BUY" or "SELL"
-    size: f64,
+    pub side: String, // "BUY" or "SELL"
+    pub size: f64,
     asset: String, // Token ID as string
     #[serde(rename = "transactionHash")]
-    transaction_hash: String,
-    title: String,
+    pub transaction_hash: String,
+    pub title: String,
     pub price: Option<f64>,
     #[serde(rename = "usdcSize")]
     pub usdc_size: Option<f64>,

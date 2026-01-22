@@ -5,9 +5,9 @@
 
 use anyhow::Result;
 use clap::Parser;
-use serde::Deserialize;
+use prediction_market_arbitrage::strategy_copy_trade::ActivityItem;
 use std::time::Duration;
-use tracing::{info, warn, Level};
+use tracing::{info, warn};
 
 const POLY_DATA_API: &str = "https://data-api.polymarket.com";
 
@@ -19,27 +19,9 @@ struct Args {
     target: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct ActivityItem {
-    #[serde(rename = "type")]
-    activity_type: String, // "TRADE"
-    timestamp: u64,
-    side: String,
-    size: f64,
-    asset: String,
-    #[serde(rename = "transactionHash")]
-    transaction_hash: String,
-    title: String,
-    pub price: Option<f64>,
-    #[serde(rename = "usdcSize")]
-    pub usdc_size: Option<f64>,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     let args = Args::parse();
     info!("🕵️ Tracker started for: {}", args.target);
@@ -50,7 +32,8 @@ async fn main() -> Result<()> {
 
     loop {
         let url = format!("{}/activity", POLY_DATA_API);
-        match client.get(&url)
+        match client
+            .get(&url)
             .query(&[
                 ("user", args.target.as_str()),
                 ("limit", "5"),
@@ -66,13 +49,18 @@ async fn main() -> Result<()> {
                     if is_first {
                         if let Some(first) = activities.first() {
                             last_hash = Some(first.transaction_hash.clone());
-                            info!("✅ Initialized. Last trade: {} ({})", first.title, first.side);
+                            info!(
+                                "✅ Initialized. Last trade: {} ({})",
+                                first.title, first.side
+                            );
                         }
                         is_first = false;
                     } else {
                         for act in &activities {
                             if let Some(last) = &last_hash {
-                                if &act.transaction_hash == last { break; }
+                                if &act.transaction_hash == last {
+                                    break;
+                                }
                             }
                             new_trades.push(act);
                         }
@@ -81,7 +69,9 @@ async fn main() -> Result<()> {
                     for trade in new_trades.iter().rev() {
                         info!(
                             "🔔 NEW TRADE: {} {} {} @ {:.2} ({} USDC) - {}",
-                            trade.side, trade.size, trade.title,
+                            trade.side,
+                            trade.size,
+                            trade.title,
                             trade.price.unwrap_or(0.0),
                             trade.usdc_size.unwrap_or(0.0),
                             trade.transaction_hash

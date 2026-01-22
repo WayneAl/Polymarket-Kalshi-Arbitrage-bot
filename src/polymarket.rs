@@ -374,6 +374,7 @@ impl Client {
                             event_start_time_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                             event_end_time_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                         );
+                        println!("[GAMMA] Fetching strike price from URL: {}", url);
                         // Using a one-off reqwest client since we removed the custom GammaClient struct
                         let http = reqwest::Client::new();
                         match http.get(&url).send().await {
@@ -418,13 +419,6 @@ pub struct Price {
     #[serde(rename = "openPrice")]
     pub open_price: Option<f64>,
 }
-
-fn increment_date_in_slug(slug: &str) -> Option<String> {
-    // Basic implementation just to satisfy dependency
-    Some(slug.to_string())
-}
-
-// === WebSocket Runner ===
 
 // === WebSocket Runner ===
 

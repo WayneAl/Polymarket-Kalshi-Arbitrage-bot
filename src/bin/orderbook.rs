@@ -6,18 +6,15 @@
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, Level};
+use tracing::info;
 
-use prediction_market_arbitrage::{config, polymarket, types::GlobalState};
+use prediction_market_arbitrage::{polymarket, types::GlobalState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
     info!("📚 Polymarket Orderbook Watcher");
-
-    // Load config just for assets
-    let config = config::load_config("config.json").unwrap_or_default();
 
     // Load .env
     dotenvy::dotenv().ok();
