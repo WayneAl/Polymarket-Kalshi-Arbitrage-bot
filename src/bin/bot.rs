@@ -9,9 +9,10 @@ use std::sync::Arc;
 use tracing::{error, info, warn, Level};
 
 // Import from the library crate
-use prediction_market_arbitrage::{
-    config, polymarket, strategy_0x8dxd, strategy_copy_trade, strategy_gabagool, types::GlobalState,
+use prediction_market_arbitrage::strategies::{
+    strategy_0x8dxd, strategy_copy_trade, strategy_gabagool,
 };
+use prediction_market_arbitrage::{config, polymarket, types::GlobalState};
 
 use polymarket::Client;
 

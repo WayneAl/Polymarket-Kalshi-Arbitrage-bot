@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use clap::Parser;
-use prediction_market_arbitrage::strategy_copy_trade::ActivityItem;
+use prediction_market_arbitrage::strategies::strategy_copy_trade::ActivityItem;
 use std::time::Duration;
 use tracing::{info, warn};
 
