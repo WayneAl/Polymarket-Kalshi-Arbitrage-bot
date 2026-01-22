@@ -58,8 +58,17 @@ regex = "1"
 rust_decimal = "1.33"
 
 # Web3 & Polymarket
-alloy = { version = "1.4.3", features = ["full", "node-bindings", "rpc-types-eth", "signer-local", "signer-aws"] }
-polymarket-client-sdk = { git = "https://github.com/Polymarket/rs-clob-client", features = ["clob", "ws", "gamma"] }
+alloy = { version = "1.4.3", default-features = false, features = [
+    "dyn-abi",
+    "reqwest",
+    "reqwest-rustls-tls",
+    "serde",
+    "signer-local",
+    "signers",
+    "sol-types"
+] }
+polymarket-client-sdk = { git = "https://github.com/Polymarket/rs-clob-client", features = ["clob", "ws", "gamma", "rtds"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

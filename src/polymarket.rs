@@ -23,9 +23,10 @@ use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::clob::types::{OrderType, Side};
 use polymarket_client_sdk::clob::Client as ClobClient;
-use polymarket_client_sdk::clob::Config;
+use polymarket_client_sdk::clob::Config as ClobConfig;
 use polymarket_client_sdk::gamma::types::request::MarketsRequest;
 use polymarket_client_sdk::gamma::Client as GammaClient;
+use polymarket_client_sdk::rtds::Client as RtdsClient;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 
@@ -90,6 +91,8 @@ pub struct Client {
     pub clob: Arc<ClobClient<Authenticated<Normal>>>,
     // We keep GammaClient for discovery
     pub gamma: Arc<GammaClient>,
+    // RTDS client for price feeds
+    pub rtds: Arc<RtdsClient>,
     // Store funder address
     pub funder: String,
     pub signer: PrivateKeySigner,
@@ -102,7 +105,7 @@ impl Client {
             .map_err(|e| anyhow!("Invalid private key: {}", e))?
             .with_chain_id(Some(chain_id));
 
-        let config = Config::default();
+        let config = ClobConfig::default();
         let clob = ClobClient::new(host, config)?
             .authentication_builder(&signer)
             .authenticate()
@@ -114,9 +117,12 @@ impl Client {
         let gamma = GammaClient::new(GAMMA_API_BASE)
             .map_err(|e| anyhow!("Failed to create Gamma client: {:?}", e))?;
 
+        let rtds = RtdsClient::default();
+
         Ok(Self {
             clob: Arc::new(clob),
             gamma: Arc::new(gamma),
+            rtds: Arc::new(rtds),
             funder: funder.to_string(),
             signer,
             chain_id,
@@ -196,10 +202,7 @@ impl Client {
         // We use limit 50 and filtered by closed=false. We will filter for "15min" in question if needed or rely on expiry logic.
 
         let mut req = MarketsRequest::default();
-        req.limit = Some(50);
-        // req.order = Some(Order::EndDate); // Order enum not found, using default
-        req.ascending = Some(true);
-        req.closed = Some(false);
+        req.slug = vec!["btc-updown-15m-1768979700".to_string()];
 
         let markets = self
             .gamma

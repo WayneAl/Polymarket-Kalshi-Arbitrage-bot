@@ -1,4 +1,8 @@
+use futures_util::StreamExt;
 use prediction_market_arbitrage::polymarket::Client;
+use std::time::Duration;
+use tokio::time::timeout;
+use tracing::{debug, info, warn};
 
 #[tokio::test]
 async fn test_discover_15m_markets_live() {
@@ -6,11 +10,6 @@ async fn test_discover_15m_markets_live() {
         .with_max_level(tracing::Level::INFO)
         .try_init();
 
-    // 1. Initialize Client
-    // We need valid-looking fake credentials because we don't want to fail on parsing
-    // but the functionality being tested (Gamma) doesn't typically require auth if implemented right.
-    // However, our Client::new implementation parses the PK.
-    // Use a random hex string for PK.
     let dummy_pk = "0000000000000000000000000000000000000000000000000000000000000001";
     let dummy_funder = "0x0000000000000000000000000000000000000000";
     let host = "https://clob.polymarket.com";
@@ -67,4 +66,160 @@ async fn test_discover_15m_markets_live() {
             panic!("❌ Discovery failed with error: {}", e);
         }
     }
+}
+
+#[tokio::test]
+async fn test_rtds() -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
+
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
+    let dummy_pk = "0000000000000000000000000000000000000000000000000000000000000001";
+    let dummy_funder = "0x0000000000000000000000000000000000000000";
+    let host = "https://clob.polymarket.com";
+
+    let client = Client::new(host, 137, dummy_pk, dummy_funder)
+        .await
+        .expect("Failed to init client");
+
+    // Subscribe to all crypto prices from Binance
+    info!(
+        stream = "crypto_prices",
+        "Subscribing to Binance prices (all symbols)"
+    );
+    match client.rtds.subscribe_crypto_prices(None) {
+        Ok(stream) => {
+            let mut stream = Box::pin(stream);
+            let mut count = 0;
+
+            while let Ok(Some(result)) = timeout(Duration::from_secs(5), stream.next()).await {
+                match result {
+                    Ok(price) => {
+                        info!(
+                            stream = "crypto_prices",
+                            symbol = %price.symbol.to_uppercase(),
+                            value = %price.value,
+                            timestamp = %price.timestamp
+                        );
+                        count += 1;
+                        if count >= 5 {
+                            break;
+                        }
+                    }
+                    Err(e) => debug!(stream = "crypto_prices", error = %e),
+                }
+            }
+            info!(stream = "crypto_prices", received = count);
+        }
+        Err(e) => debug!(stream = "crypto_prices", error = %e),
+    }
+
+    // Subscribe to specific crypto symbols
+    let symbols = vec!["btcusdt".to_owned(), "ethusdt".to_owned()];
+    info!(
+        stream = "crypto_prices_filtered",
+        symbols = ?symbols,
+        "Subscribing to specific symbols"
+    );
+    match client.rtds.subscribe_crypto_prices(Some(symbols.clone())) {
+        Ok(stream) => {
+            let mut stream = Box::pin(stream);
+            let mut count = 0;
+
+            while let Ok(Some(result)) = timeout(Duration::from_secs(5), stream.next()).await {
+                match result {
+                    Ok(price) => {
+                        info!(
+                            stream = "crypto_prices_filtered",
+                            symbol = %price.symbol.to_uppercase(),
+                            value = %price.value
+                        );
+                        count += 1;
+                        if count >= 3 {
+                            break;
+                        }
+                    }
+                    Err(e) => debug!(stream = "crypto_prices_filtered", error = %e),
+                }
+            }
+            info!(stream = "crypto_prices_filtered", received = count);
+        }
+        Err(e) => debug!(stream = "crypto_prices_filtered", error = %e),
+    }
+
+    // Subscribe to specific Chainlink symbol
+    let chainlink_symbol = "btc/usd".to_owned();
+    info!(
+        stream = "chainlink_prices",
+        symbol = %chainlink_symbol,
+        "Subscribing to Chainlink price feed"
+    );
+    match client
+        .rtds
+        .subscribe_chainlink_prices(Some(chainlink_symbol))
+    {
+        Ok(stream) => {
+            let mut stream = Box::pin(stream);
+            let mut count = 0;
+
+            while let Ok(Some(result)) = timeout(Duration::from_secs(5), stream.next()).await {
+                match result {
+                    Ok(price) => {
+                        info!(
+                            stream = "chainlink_prices",
+                            symbol = %price.symbol,
+                            value = %price.value,
+                            timestamp = %price.timestamp
+                        );
+                        count += 1;
+                        if count >= 3 {
+                            break;
+                        }
+                    }
+                    Err(e) => debug!(stream = "chainlink_prices", error = %e),
+                }
+            }
+            info!(stream = "chainlink_prices", received = count);
+        }
+        Err(e) => debug!(stream = "chainlink_prices", error = %e),
+    }
+
+    // Show subscription count before unsubscribe
+    let sub_count = client.rtds.subscription_count();
+    info!(
+        endpoint = "subscription_count",
+        count = sub_count,
+        "Before unsubscribe"
+    );
+
+    // Demonstrate unsubscribe functionality
+    info!("=== Demonstrating unsubscribe ===");
+
+    // Unsubscribe from crypto_prices (Binance)
+    info!("Unsubscribing from Binance crypto prices");
+    match client.rtds.unsubscribe_crypto_prices() {
+        Ok(()) => info!("Successfully unsubscribed from crypto_prices"),
+        Err(e) => warn!(error = %e, "Failed to unsubscribe from crypto_prices"),
+    }
+
+    // Unsubscribe from chainlink prices
+    info!("Unsubscribing from Chainlink prices");
+    match client.rtds.unsubscribe_chainlink_prices() {
+        Ok(()) => info!("Successfully unsubscribed from chainlink_prices"),
+        Err(e) => warn!(error = %e, "Failed to unsubscribe from chainlink_prices"),
+    }
+
+    // Show final subscription count after unsubscribe
+    let sub_count = client.rtds.subscription_count();
+    info!(
+        endpoint = "subscription_count",
+        count = sub_count,
+        "After unsubscribe"
+    );
+
+    Ok(())
 }
