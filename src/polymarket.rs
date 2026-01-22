@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::interval;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 // Official Client Imports
 use alloy::primitives::U256;
@@ -104,14 +104,19 @@ pub struct Client {
     price_feed_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
+/// Polymarket CLOB API host
+const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
+/// Polygon chain ID
+const POLYGON_CHAIN_ID: u64 = 137;
+
 impl Client {
-    pub async fn new(host: &str, chain_id: u64, private_key: &str, funder: &str) -> Result<Self> {
+    pub async fn new(private_key: &str, funder: &str) -> Result<Self> {
         let signer = PrivateKeySigner::from_str(private_key)
             .map_err(|e| anyhow!("Invalid private key: {}", e))?
-            .with_chain_id(Some(chain_id));
+            .with_chain_id(Some(POLYGON_CHAIN_ID));
 
         let config = ClobConfig::default();
-        let clob = ClobClient::new(host, config)?
+        let clob = ClobClient::new(POLY_CLOB_HOST, config)?
             .authentication_builder(&signer)
             .authenticate()
             .await?;
@@ -137,7 +142,7 @@ impl Client {
             rtds: Arc::new(rtds),
             funder: funder.to_string(),
             signer,
-            chain_id,
+            chain_id: POLYGON_CHAIN_ID,
             price_tx,
             price_feed_task: Arc::new(tokio::sync::Mutex::new(None)),
         })

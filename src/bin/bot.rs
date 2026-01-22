@@ -15,11 +15,6 @@ use prediction_market_arbitrage::{
 
 use polymarket::Client;
 
-/// Polymarket CLOB API host
-const POLY_CLOB_HOST: &str = "https://clob.polymarket.com";
-/// Polygon chain ID
-const POLYGON_CHAIN_ID: u64 = 137;
-
 struct SimpleTime;
 impl tracing_subscriber::fmt::time::FormatTime for SimpleTime {
     fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
@@ -63,13 +58,7 @@ async fn main() -> Result<()> {
 
     // Create new Client (official-based)
     info!("[POLYMARKET] Initializing official CLOB client...");
-    let poly_client = Client::new(
-        POLY_CLOB_HOST,
-        POLYGON_CHAIN_ID,
-        &poly_private_key,
-        &poly_funder,
-    )
-    .await?;
+    let poly_client = Client::new(&poly_private_key, &poly_funder).await?;
 
     info!("[POLYMARKET] Client ready for {}", &poly_funder[..10]);
 

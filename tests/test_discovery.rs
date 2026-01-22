@@ -12,9 +12,8 @@ async fn test_discover_15m_markets_live() {
 
     let dummy_pk = "0000000000000000000000000000000000000000000000000000000000000001";
     let dummy_funder = "0x0000000000000000000000000000000000000000";
-    let host = "https://clob.polymarket.com";
 
-    let client = Client::new(host, 137, dummy_pk, dummy_funder)
+    let client = Client::new(dummy_pk, dummy_funder)
         .await
         .expect("Failed to init client");
     println!("Fetching 15m markets from Gamma/Polymarket API...");
@@ -76,9 +75,8 @@ async fn test_rtds() -> anyhow::Result<()> {
 
     let dummy_pk = "0000000000000000000000000000000000000000000000000000000000000001";
     let dummy_funder = "0x0000000000000000000000000000000000000000";
-    let host = "https://clob.polymarket.com";
 
-    let client = Client::new(host, 137, dummy_pk, dummy_funder)
+    let client = Client::new(dummy_pk, dummy_funder)
         .await
         .expect("Failed to init client");
 

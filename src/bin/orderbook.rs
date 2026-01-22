@@ -29,10 +29,8 @@ async fn main() -> Result<()> {
     let pk = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
     let funder = std::env::var("FUNDER").ok().unwrap_or_default(); // Funder optional? Or use same address?
                                                                    // Host and ChainID
-    let host = "https://clob.polymarket.com";
-    let chain_id = 137;
 
-    let client = polymarket::Client::new(host, chain_id, &pk, &funder)
+    let client = polymarket::Client::new(&pk, &funder)
         .await
         .expect("Failed to initialize Polymarket Client");
 
