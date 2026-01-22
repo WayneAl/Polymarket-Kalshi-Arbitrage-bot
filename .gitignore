@@ -7,3 +7,4 @@ claude.md
 positions.json
 .discovery_cache.json
 ts-scripts/
+temp_sdk/
