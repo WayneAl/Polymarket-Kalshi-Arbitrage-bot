@@ -74,7 +74,7 @@ async fn test_rtds() -> anyhow::Result<()> {
         .with_max_level(tracing::Level::INFO)
         .try_init();
 
-    rustls::crypto::aws_lc_rs::default_provider()
+    rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
@@ -119,6 +119,7 @@ async fn test_rtds() -> anyhow::Result<()> {
     }
 
     // Subscribe to specific crypto symbols
+    // in lower case
     let symbols = vec!["btcusdt".to_owned(), "ethusdt".to_owned()];
     info!(
         stream = "crypto_prices_filtered",

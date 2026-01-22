@@ -68,7 +68,7 @@ alloy = { version = "1.4.3", default-features = false, features = [
     "sol-types"
 ] }
 polymarket-client-sdk = { git = "https://github.com/Polymarket/rs-clob-client", features = ["clob", "ws", "gamma", "rtds"] }
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
