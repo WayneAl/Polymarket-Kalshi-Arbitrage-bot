@@ -74,10 +74,6 @@ async fn test_rtds() -> anyhow::Result<()> {
         .with_max_level(tracing::Level::INFO)
         .try_init();
 
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("Failed to install rustls crypto provider");
-
     let dummy_pk = "0000000000000000000000000000000000000000000000000000000000000001";
     let dummy_funder = "0x0000000000000000000000000000000000000000";
     let host = "https://clob.polymarket.com";
@@ -95,6 +91,10 @@ async fn test_rtds() -> anyhow::Result<()> {
         Ok(stream) => {
             let mut stream = Box::pin(stream);
             let mut count = 0;
+
+            while let Some(msg) = stream.next().await {
+                println!("msg: {:?}", msg);
+            }
 
             while let Ok(Some(result)) = timeout(Duration::from_secs(5), stream.next()).await {
                 match result {

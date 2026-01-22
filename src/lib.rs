@@ -1,5 +1,4 @@
 // Re-export modules for use in binaries
-pub mod binance_ws;
 pub mod config;
 pub mod polymarket;
 // strategies

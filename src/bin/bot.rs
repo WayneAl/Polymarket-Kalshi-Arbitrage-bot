@@ -10,8 +10,7 @@ use tracing::{error, info, warn, Level};
 
 // Import from the library crate
 use prediction_market_arbitrage::{
-    binance_ws, config, polymarket, strategy_0x8dxd, strategy_copy_trade, strategy_gabagool,
-    types::GlobalState,
+    config, polymarket, strategy_0x8dxd, strategy_copy_trade, strategy_gabagool, types::GlobalState,
 };
 
 use polymarket::Client;
@@ -74,19 +73,14 @@ async fn main() -> Result<()> {
 
     info!("[POLYMARKET] Client ready for {}", &poly_funder[..10]);
 
+    // Start the global price feed for all strategies
+    info!("[PRICE_FEED] Starting global price feed...");
+    poly_client.start_price_feed().await?;
+
     // === MAIN SESSION LOOP ===
 
     // Globals
     let state = Arc::new(tokio::sync::RwLock::new(GlobalState::new()));
-
-    // 2. Initialize Binance Price Feed (One for all strategies)
-    let symbols: Vec<String> = config.assets.iter().map(|a| a.symbol.clone()).collect();
-    info!("🚀 Connecting to Binance Stream for {:?}...", symbols);
-    let (binance_client, binance_driver) =
-        binance_ws::BinanceClient::new(binance_ws::BINANCE_WS_URL.to_string());
-
-    // Spawn Binance (forever)
-    tokio::spawn(binance_driver.run());
 
     // 4. Discovery Setup
     // Trackers
@@ -185,7 +179,6 @@ async fn main() -> Result<()> {
                                 asset_cfg.symbol.clone(),
                                 asset_cfg.default_sigma,
                                 poly_client.clone(),
-                                binance_client.clone(),
                             )
                             .await;
                             tokio::spawn(strat.run(dry_run))

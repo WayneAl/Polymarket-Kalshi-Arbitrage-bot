@@ -5,14 +5,14 @@ use rand::thread_rng;
 
 use serde_json::Value;
 use statrs::distribution::{ContinuousCDF, Normal};
+use std::collections::VecDeque;
 use std::sync::Arc;
-use tokio::sync::broadcast;
 use tracing::{error, info, warn};
-
-use crate::binance_ws::{BinanceClient, BinancePrice};
 
 use crate::polymarket::Client;
 use crate::types::GlobalState;
+use polymarket_client_sdk::rtds::CryptoPrice;
+use rust_decimal::prelude::ToPrimitive;
 
 // Configurable parameters
 const MIN_SKEW_PROFIT_CENTS: f64 = 2.0; // Minimum edge (cents) to execute
@@ -32,8 +32,8 @@ pub struct Strategy0x8dxd {
     market_id: u16,
     asset: String, // e.g., "BTC", "ETH"
     client: Client,
-    price_rx: broadcast::Receiver<BinancePrice>,
-    binance_client: BinanceClient,
+    price_history: VecDeque<(i64, f64)>,
+
     pricing_model: PricingModel,
 
     strike_price: f64,
@@ -50,16 +50,12 @@ impl Strategy0x8dxd {
         asset: String,
         default_sigma: f64,
         client: Client,
-        binance_client: BinanceClient,
     ) -> Self {
         // Select model from environment or default to Black-Scholes
         let pricing_model = match std::env::var("PRICING_MODEL").unwrap_or_default().as_str() {
             "monte_carlo" | "mc" => PricingModel::MonteCarlo,
             _ => PricingModel::BlackScholes,
         };
-
-        // Subscribe to asset price feed
-        let price_rx = binance_client.subscribe(&asset);
 
         // Fetch market info (strike, expiry, ref price)
         let (strike_price, expiry_ts, _binance_ref_price) = {
@@ -110,9 +106,10 @@ impl Strategy0x8dxd {
             state,
             market_id,
             asset,
+
             client,
-            price_rx,
-            binance_client,
+            price_history: VecDeque::new(),
+
             pricing_model,
             strike_price,
             expiry_ts,
@@ -133,42 +130,46 @@ impl Strategy0x8dxd {
 
         info!("[0x8dxd] Strategy loop started for {}", pair_id);
 
-        loop {
-            match self.price_rx.recv().await {
-                Ok(price_update) => {
-                    // No need to filter by symbol here, subscription is specific
-                    match self.process_tick(&price_update, dry_run).await {
-                        Ok(should_stop) => {
-                            if should_stop {
-                                info!("[0x8dxd] Strategy expired for {}", pair_id);
-                                break;
-                            }
-                        }
-                        Err(e) => error!("[0x8dxd] Error processing tick for {}: {}", pair_id, e),
+        // Subscribe to the global price feed
+        let mut price_rx = self.client.subscribe_prices();
+        let asset_lower = self.asset.to_lowercase();
+
+        while let Ok(price) = price_rx.recv().await {
+            // Filter for this strategy's asset
+            if !price.symbol.to_lowercase().starts_with(&asset_lower) {
+                continue;
+            }
+
+            match self.process_tick(&price, dry_run).await {
+                Ok(should_stop) => {
+                    if should_stop {
+                        info!("[0x8dxd] Strategy expired for {}", pair_id);
+                        break;
                     }
                 }
-                Err(broadcast::error::RecvError::Closed) => {
-                    info!(
-                        "[0x8dxd] Price feed closed, stopping strategy for {}",
-                        pair_id
-                    );
-                    break;
-                }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!("[0x8dxd] Price feed lagged, skipped {} messages", skipped);
-                }
+                Err(e) => error!("[0x8dxd] Error processing tick for {}: {}", pair_id, e),
             }
         }
+        info!("[0x8dxd] Strategy Stopped for {}", pair_id);
     }
 
     /// Returns Ok(true) if the strategy should stop (expired), Ok(false) otherwise.
-    async fn process_tick(&mut self, binance_price: &BinancePrice, dry_run: bool) -> Result<bool> {
-        let btc_price = binance_price.mid; // Use mid price
-                                           // update_price_history is now handled by BinanceClient
+    async fn process_tick(&mut self, price_update: &CryptoPrice, dry_run: bool) -> Result<bool> {
+        let price = price_update.value.to_f64().unwrap_or_default();
+
+        if price == 0.0 {
+            return Ok(false);
+        }
+
+        // Update history and calc volatility
+        let now_exec = Utc::now().timestamp();
+        self.update_history(now_exec, price);
 
         // Calculate Realized Volatility (Annualized)
-        let mut sigma = self.binance_client.get_iv(&self.asset).unwrap_or(0.5);
+        let mut sigma = self.get_iv().unwrap_or(0.5);
         sigma = sigma.max(self.default_sigma);
+
+        // check timestamp from price? rtds price has timestamp usually
 
         let now_ts = Utc::now().timestamp();
         let time_remaining_secs = self.expiry_ts - now_ts;
@@ -179,11 +180,11 @@ impl Strategy0x8dxd {
 
         let time_to_expiry_years = time_remaining_secs as f64 / (365.0 * 24.0 * 3600.0);
 
-        let calibrated_btc_price = if self.binance_ref_price > 0.0 {
+        let calibrated_price = if self.binance_ref_price > 0.0 {
             let offset = self.binance_ref_price - self.strike_price;
-            btc_price - offset
+            price - offset
         } else {
-            btc_price
+            price
         };
 
         if self.strike_price == 0.0 {
@@ -192,24 +193,24 @@ impl Strategy0x8dxd {
 
         let fair_prob_yes = match self.pricing_model {
             PricingModel::BlackScholes => Self::calculate_prob_bs(
-                calibrated_btc_price,
+                calibrated_price,
                 self.strike_price,
                 time_to_expiry_years,
                 sigma,
             ),
             PricingModel::MonteCarlo => Self::calculate_prob_mc(
-                calibrated_btc_price,
+                calibrated_price,
                 self.strike_price,
                 time_to_expiry_years,
                 sigma,
             ),
         };
 
-        // info!(
-        //     target: "strategy_0x8dxd",
-        //     "Price: {}, Strike: {}, Time: {}, Prob: {}s, Sigma: {}",
-        //     calibrated_btc_price, self.strike_price, time_remaining_secs, fair_prob_yes, sigma
-        // );
+        info!(
+            target: "strategy_0x8dxd",
+            "Price: {}, Strike: {}, Time: {}, Prob: {}s, Sigma: {}",
+            calibrated_price, self.strike_price, time_remaining_secs, fair_prob_yes, sigma
+        );
 
         let fair_prob_no = 1.0 - fair_prob_yes;
 
@@ -221,7 +222,7 @@ impl Strategy0x8dxd {
             (p.poly_yes_token.clone(), p.poly_no_token.clone(), ya, na)
         };
 
-        // info!("YES ASK: {} NO ASK: {}", yes_ask, no_ask);
+        info!("YES ASK: {} NO ASK: {}", yes_ask, no_ask);
 
         if yes_ask + no_ask < 100 {
             info!("YES ASK: {} NO ASK: {}", yes_ask, no_ask);
@@ -379,6 +380,56 @@ impl Strategy0x8dxd {
         }
 
         anyhow::bail!("Failed to parse Binance historical price")
+    }
+
+    fn update_history(&mut self, timestamp: i64, price: f64) {
+        // Limit updates to once per second
+        if let Some(&(last_time, _)) = self.price_history.back() {
+            if timestamp - last_time < 1 {
+                return;
+            }
+        }
+
+        self.price_history.push_back((timestamp, price));
+
+        // Prune old (30 mins = 1800s)
+        while let Some(&(time, _)) = self.price_history.front() {
+            if timestamp - time > 1800 {
+                self.price_history.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn get_iv(&self) -> Option<f64> {
+        if self.price_history.len() < 10 {
+            return None;
+        }
+
+        // Calculate IV
+        let mut log_returns = Vec::new();
+        let mut data_iter = self.price_history.iter();
+        let mut prev_price = data_iter.next()?.1;
+
+        for &(_, price) in data_iter {
+            let log_ret = (price / prev_price).ln();
+            log_returns.push(log_ret);
+            prev_price = price;
+        }
+
+        if log_returns.is_empty() {
+            return None;
+        }
+
+        let n = log_returns.len() as f64;
+        let mean = log_returns.iter().sum::<f64>() / n;
+        let variance = log_returns.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        let std_dev = variance.sqrt();
+
+        let samples_per_year: f64 = 365.0 * 24.0 * 3600.0;
+        let annualized_vol = std_dev * samples_per_year.sqrt();
+        Some(annualized_vol)
     }
 }
 

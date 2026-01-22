@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::interval;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{info, warn};
+use tracing::{info, warn, error};
 
 // Official Client Imports
 use alloy::primitives::U256;
@@ -32,6 +32,7 @@ use rust_decimal::Decimal;
 
 use crate::config::{GAMMA_API_BASE, POLYMARKET_WS_URL, POLY_PING_INTERVAL_SECS};
 use crate::types::{fxhash_str, parse_price, GlobalState, MarketPair, MarketType, SizeCents};
+use polymarket_client_sdk::rtds::CryptoPrice;
 
 // === Types ===
 
@@ -97,6 +98,10 @@ pub struct Client {
     pub funder: String,
     pub signer: PrivateKeySigner,
     pub chain_id: u64,
+    // Broadcast channel for price updates (shared across strategies)
+    price_tx: tokio::sync::broadcast::Sender<CryptoPrice>,
+    // Task handle for the global price feed
+    price_feed_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl Client {
@@ -117,7 +122,14 @@ impl Client {
         let gamma = GammaClient::new(GAMMA_API_BASE)
             .map_err(|e| anyhow!("Failed to create Gamma client: {:?}", e))?;
 
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("Failed to install rustls crypto provider");
+
         let rtds = RtdsClient::default();
+
+        // Create broadcast channel for price updates (large buffer to avoid dropping messages)
+        let (price_tx, _) = tokio::sync::broadcast::channel(1000);
 
         Ok(Self {
             clob: Arc::new(clob),
@@ -126,7 +138,57 @@ impl Client {
             funder: funder.to_string(),
             signer,
             chain_id,
+            price_tx,
+            price_feed_task: Arc::new(tokio::sync::Mutex::new(None)),
         })
+    }
+
+    /// Start the global price feed that broadcasts crypto prices to all strategies
+    /// This should be called once at startup, and strategies subscribe via subscribe_prices()
+    pub async fn start_price_feed(&self) -> Result<()> {
+        let mut task_guard = self.price_feed_task.lock().await;
+
+        // Only start if not already running
+        if task_guard.is_some() {
+            return Ok(());
+        }
+
+        let rtds_client = self.rtds.clone();
+        let price_tx = self.price_tx.clone();
+
+        let handle = tokio::spawn(async move {
+            // Subscribe to all crypto prices
+            match rtds_client.subscribe_crypto_prices(None) {
+                Ok(stream) => {
+                    let mut price_stream = Box::pin(stream);
+
+                    while let Some(msg) = price_stream.next().await {
+                        match msg {
+                            Ok(price) => {
+                                // Broadcast to all strategies (ignore if no subscribers)
+                                let _ = price_tx.send(price);
+                            }
+                            Err(e) => {
+                                warn!("[PRICE_FEED] Stream error: {}", e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("[PRICE_FEED] Failed to subscribe: {}", e);
+                }
+            }
+        });
+
+        *task_guard = Some(handle);
+        info!("[PRICE_FEED] Global price feed started");
+        Ok(())
+    }
+
+    /// Subscribe to price updates for a specific symbol
+    /// Returns a broadcast receiver that will receive CryptoPrice updates
+    pub fn subscribe_prices(&self) -> tokio::sync::broadcast::Receiver<CryptoPrice> {
+        self.price_tx.subscribe()
     }
 
     /// Execute FAK buy order
@@ -201,8 +263,13 @@ impl Client {
         // Gamma API search by tag is usually via events endpoint, but let's try strict markets request if possible.
         // We use limit 50 and filtered by closed=false. We will filter for "15min" in question if needed or rely on expiry logic.
 
+        // find recent 15M timestamp
+        let ts_now = Utc::now().timestamp();
+        let recent_15m = ts_now - ts_now % (15 * 60);
+        println!("Recent 15m timestamp: {}", recent_15m);
+
         let mut req = MarketsRequest::default();
-        req.slug = vec!["btc-updown-15m-1768979700".to_string()];
+        req.slug = vec![format!("btc-updown-15m-{}", recent_15m)];
 
         let markets = self
             .gamma
@@ -333,7 +400,7 @@ pub async fn run_ws(state: Arc<tokio::sync::RwLock<GlobalState>>) -> Result<()> 
     let (ws_stream, _) = connect_async(POLYMARKET_WS_URL)
         .await
         .context("Failed to connect to Poly WS")?;
-    info!("[POLY] Connected");
+    info!("[POLY CLOB WS] Connected");
     let (mut write, mut read) = ws_stream.split();
 
     let subscribe_msg = SubscribeCmd {
